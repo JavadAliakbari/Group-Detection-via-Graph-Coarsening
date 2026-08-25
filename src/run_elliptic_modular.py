@@ -165,7 +165,9 @@ def _gang_diagnostic_rows(det, data, gangs, gang_sets, edge_index, day, node_to_
     res, _ = evaluate_loukas_patterns(
         gangs, node_to_super, data.y, threshold=det.config.threshold
     )
-    phi, mbar1 = gang_moments(data.a_hat, data.adjacency, gangs)
+    phi, mbar1 = gang_moments(
+        data.a_hat, data.adjacency, gangs, geometry=det.geometry(data)
+    )
     cap = det.capture(data, gangs)["per_gang_capture"]
     gang_of = torch.full((data.num_nodes,), -1, dtype=torch.long)
     for gi, S in enumerate(gang_sets):
@@ -709,6 +711,37 @@ def main() -> None:
         "--coarsening-laplacian",
         choices=["symmetric", "combinatorial"],
         default="symmetric",
+        help="THE geometry switch -- it is not confined to the coarsener (the name "
+        "is historical).  It selects the screened metric M_tau the filter bank is "
+        "trained in, the group indicator v_S that capture and confusability are "
+        "fractions of, the operator the Chebyshev bank propagates on, and the "
+        "metric the RSA distortion is measured in.  'symmetric': L = I - A_hat, "
+        "v_S = D_tilde^{1/2} 1_S / sqrt(vol(S)), Phi(S) = cut/vol (conductance).  "
+        "'combinatorial': L = D - W, v_S = 1_S / sqrt(|S|), Phi(S) = cut/|S| -- "
+        "the paper's Section 3.  NOTE tau screens relative to the Laplacian's own "
+        "scale, and lambda_max(D - W) >> lambda_max(L_sym) <= 2, so the same "
+        "numeric --tau is a much weaker screening under 'combinatorial'; the log "
+        "prints the like-for-like equivalent.",
+    )
+    ap.add_argument(
+        "--propagation",
+        choices=["auto", "a_hat"],
+        default="auto",
+        help="operator the Chebyshev bank filters on.  'auto' follows "
+        "--coarsening-laplacian (the paper's pairing L_tilde = 2L/lambda_max - I); "
+        "'a_hat' pins it to A_hat so a combinatorial run differs from a symmetric "
+        "one ONLY in the metric and the indicator -- which separates the geometry "
+        "effect from the fact that I - 2(D-W)/lambda_max is near-identity on "
+        "low-degree nodes and so diffuses far less per hop.",
+    )
+    ap.add_argument(
+        "--indicator",
+        choices=["geometry", "degree_weighted", "plain"],
+        default="geometry",
+        help="gang signal the REPORTED capture is a fraction of.  'geometry' "
+        "(default) takes it from --coarsening-laplacian so the reported number is "
+        "the one the fit actually ascended; the other two pin it explicitly, which "
+        "is what you want to score the SAME signal under both geometries.",
     )
     ap.add_argument(
         "--pr-sweep",
@@ -731,7 +764,7 @@ def main() -> None:
     ap.add_argument("--epsilon", type=float, default=1.0)
     ap.add_argument("--max-levels", type=int, default=10)
 
-    ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="epsilon")
+    ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="f1")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
     # --- Smooth Dual Ward (coarsening_method="dual-ward"; see src.smooth_dual_ward) ---
@@ -887,6 +920,8 @@ def main() -> None:
         head_diversity=args.head_diversity,
         coarsening_method=args.coarsening_method,
         coarsening_laplacian=args.coarsening_laplacian,
+        propagation=args.propagation,
+        indicator=args.indicator,
         reduction=args.reduction,
         epsilon=args.epsilon,
         max_levels=args.max_levels,
@@ -920,6 +955,19 @@ def main() -> None:
             f"({int((label_y[label_idx] == 1).sum()):,} illicit)"
         )
 
+    geo = det.geometry(data)
+    LOGGER.info(
+        f"\n  Geometry: {geo.describe()}"
+        f"   propagation={'A_hat' if geo.prop is data.a_hat else 'I - 2L/lambda_max'}"
+    )
+    if geo.kind == "combinatorial":
+        LOGGER.info(
+            f"    screening: tau={cfg.tau:g} here is like tau="
+            f"{cfg.tau / geo.tau_equivalent:.4g} in the symmetric geometry "
+            f"(lambda_max ratio {geo.tau_equivalent:.4g}); the block-distortion "
+            f"bound mu_P^tau <= sqrt((lambda_max+tau)/tau) is "
+            f"{((geo.lambda_max + cfg.tau) / (cfg.tau + 1e-12)) ** 0.5:.3g}"
+        )
     LOGGER.info(
         f"\n  Fitting collective bank (basis={cfg.basis}, tau={cfg.tau}, "
         f"K={cfg.degree}, opt={cfg.optimizer}, objective={cfg.capture_objective}"
@@ -1139,8 +1187,15 @@ def main() -> None:
         LOGGER.info("\n" + "=" * 74)
         LOGGER.info("COARSENER COMPARISON (same learned target basis + train gangs)")
         LOGGER.info("=" * 74)
-        variants = [("ward", {}), (f"dual-ward a={args.dual_ward_alpha:g}", {})]
-        methods = {"ward": "ward", variants[1][0]: "dual-ward"}
+        variants = [("ward", {})]
+        methods = {"ward": "ward"}
+        if cfg.coarsening_laplacian not in ("combinatorial", "comb"):
+            # Smooth Dual Ward scores merges in L_sym + tau I only, so under the
+            # combinatorial geometry it would coarsen in a different metric than
+            # the target and the RSA budget are stated in -- drop it rather than
+            # print a number that is not comparable to the others in this table.
+            variants.append((f"dual-ward a={args.dual_ward_alpha:g}", {}))
+            methods[variants[-1][0]] = "dual-ward"
         if cfg.coarsening_method not in ("ward", "dual-ward"):
             variants.append((cfg.coarsening_method, {}))
             methods[cfg.coarsening_method] = cfg.coarsening_method
@@ -1386,6 +1441,13 @@ def main() -> None:
             "epsilon": co.epsilon,
         },
         "report": result["report"],
+        # per-split capture C_S = Gamma_jj, measured in the run's own geometry
+        # (--coarsening-laplacian) against its own indicator (--indicator), so it
+        # is comparable across runs only when those two match
+        "captures": {
+            name: {k: v for k, v in cap.items() if k != "per_gang_capture"}
+            for name, cap in (result.get("captures") or {}).items()
+        },
         "coarsener_comparison": result.get("coarsener_comparison") or None,
         # how the SHARED filter did on each training group's own graph (empty for a
         # single group); printed above, kept here so the export path can read it

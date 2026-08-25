@@ -94,13 +94,23 @@ def cached_wallet_features(
 
 
 # --------------------------------------------------------------------------- #
-def gang_moments(a_hat, adjacency, patterns):
-    """``(Phi, mbar1)`` per gang: conductance and the boundary-edge mean m_2/m_1."""
+def gang_moments(a_hat, adjacency, patterns, geometry=None):
+    """``(Phi, mbar1)`` per gang: the boundary ratio and the boundary-edge mean m_2/m_1.
 
-    V = degree_weighted_indicators(adjacency, patterns)  # (N, m), ||v||_2 = 1
-    LV = _l_apply(a_hat, V)
+    ``geometry`` fixes both the indicator and the Laplacian, so the reported
+    ``Phi`` is the same quantity the detector trained on: the conductance
+    ``cut(S)/vol(S)`` under the symmetric convention, and the cardinality-
+    normalized ``cut(S)/|S|`` under the combinatorial one.  ``None`` keeps the
+    historical symmetric reading.
+    """
+
+    from src.run_collective_bank_detection import _geometry_or_symmetric
+
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    V = geo.indicators(patterns)  # (N, m), ||v||_2 = 1
+    LV = geo.l_apply(V)
     m1 = (V * LV).sum(0)  # v^T L v = Phi
-    L2V = _l_apply(a_hat, LV)
+    L2V = geo.l_apply(LV)
     m2 = (V * L2V).sum(0)  # v^T L^2 v
     return m1, m2 / m1.clamp_min(1e-12)
 

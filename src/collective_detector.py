@@ -147,11 +147,28 @@ class DetectorConfig:
     # "bank+dictionary" both concatenated
     coarsen_target: str = "bank"
     structural_width: int = 0
-    indicator: str = "degree_weighted"  # capture/energy indicator
+    # gang signal the REPORTED capture is a fraction of.  "geometry" takes it from
+    # coarsening_laplacian, so the reported number is always the one the fit
+    # ascended (degree-weighted under symmetric, uniform under combinatorial);
+    # "degree_weighted"/"plain" pin it explicitly for cross-geometry reporting.
+    indicator: str = "geometry"
 
     # --- coarsening + detection ----------------------------------------------
     coarsening_method: str = "ward-tree"
+    # THE geometry switch: it selects the screened metric M_tau the filter bank is
+    # trained in, the group indicator v_S the capture/confusability are fractions
+    # of, the operator the Chebyshev bank propagates on, AND the metric the RSA
+    # distortion of the coarsening is measured in -- see src.screened_geometry.
+    # (The name is historical: it used to reach the coarsener only.)
+    #   "symmetric"     L = I - A_hat,  v_S = D_tilde^{1/2} 1_S / sqrt(vol(S)),
+    #                   Phi(S) = cut/vol  (conductance)
+    #   "combinatorial" L = D - W,      v_S = 1_S / sqrt(|S|),
+    #                   Phi(S) = cut/|S|  (the paper's Section 3)
     coarsening_laplacian: str = "symmetric"  # "symmetric" | "combinatorial"
+    # operator the bank filters on: "auto" follows coarsening_laplacian (the
+    # paper's pairing), "a_hat" pins propagation to A_hat so a combinatorial run
+    # differs from a symmetric one ONLY in the metric and the indicator.
+    propagation: str = "auto"  # "auto" | "a_hat"
     reduction: float = 0.7
     epsilon: float | None = 0.5  # RSA distortion budget (None -> reduction only)
     epsilon_ramp_levels: int = 5
@@ -243,8 +260,41 @@ class CollectiveBankDetector:
         # closed-form solver: dictionary coefficients (P, m), frozen and reused
         # on transfer days exactly like ``theta_``
         self.pencil_theta_: torch.Tensor | None = None
+        # one ScreenedGeometry per GraphData (see ``geometry``)
+        self._geometry_cache: dict = {}
 
     # -- internals ---------------------------------------------------------- #
+    def geometry(self, data: GraphData):
+        """The :class:`~src.screened_geometry.ScreenedGeometry` for one graph.
+
+        Built from ``config.coarsening_laplacian`` / ``config.propagation`` and
+        cached, because the combinatorial constructor estimates
+        ``lambda_max(D - W)`` and every stage -- fit, target subspace, capture,
+        coarsening -- must be handed the *same* object or they would silently
+        measure in slightly different metrics.
+
+        The cache is keyed on the *adjacency* rather than the ``GraphData``: the
+        geometry already holds the adjacency, so caching adds no retention beyond
+        a sparse ``W``, whereas keying on the ``GraphData`` would pin every
+        transfer day's feature matrix alive for the whole run.  ``id`` reuse is
+        ruled out by re-checking identity against the cached geometry.
+        """
+
+        from src.screened_geometry import build_geometry
+
+        key = id(data.adjacency)
+        cached = self._geometry_cache.get(key)
+        if cached is not None and cached.adjacency is data.adjacency:
+            return cached
+        geo = build_geometry(
+            data.a_hat,
+            data.adjacency,
+            self.config.coarsening_laplacian,
+            propagation=self.config.propagation,
+        )
+        self._geometry_cache[key] = geo
+        return geo
+
     def _negative_sampler(self, data: GraphData, train_patterns: list):
         c = self.config
         if c.num_neg <= 0 or c.neg_weight <= 0.0:
@@ -326,8 +376,10 @@ class CollectiveBankDetector:
 
         c = self.config
         specs = self._as_day_specs(days, train_patterns)
+        geometries = [self.geometry(d) for _lbl, d, _p, _te in specs]
 
         if c.collective_solver in ("closed-form", "aeq"):
+            self._require_symmetric(c.collective_solver)
             from src.margin_pencil import aeq_pencil_theta, collective_pencil_theta
 
             thetas, reports = [], {}
@@ -378,6 +430,7 @@ class CollectiveBankDetector:
             return self
 
         if c.collective_solver == "trace-ratio":
+            self._require_symmetric(c.collective_solver)
             from src.trace_ratio_bank import fit_trace_ratio_bank
 
             self.fit_info_ = fit_trace_ratio_bank(
@@ -426,14 +479,17 @@ class CollectiveBankDetector:
             label_y=label_y,
             label_idx=label_idx,
             day_aggregate=c.day_aggregate,
+            geometries=geometries,
         )
         self.theta_ = self.fit_info_["theta"]
+        self.fit_info_["geometry"] = geometries[0].describe()
         return self
 
     def target_subspace(self, data: GraphData, train_patterns: list) -> torch.Tensor:
         """Coarsening target ``R = span(Z)`` from the learned filter (needs :meth:`fit`)."""
 
         c = self.config
+        geo = self.geometry(data)
         if c.collective_solver in ("closed-form", "aeq"):
             from src.margin_pencil import apply_dictionary_theta
 
@@ -460,12 +516,14 @@ class CollectiveBankDetector:
             seed=c.seed,
             coarsen_target=c.coarsen_target,
             basis=c.basis,
+            geometry=geo,
         )
 
     def capture(self, data: GraphData, patterns: list) -> dict:
         """Per-gang retained ``M_tau``-energy (capture) of ``patterns``."""
 
         c = self.config
+        geo = self.geometry(data)
         if c.collective_solver in ("closed-form", "aeq"):
             # no filter bank exists; measure the target subspace itself
             from src.run_collective_bank_detection import _basis_retained_energy
@@ -479,11 +537,16 @@ class CollectiveBankDetector:
                 c.ridge,
                 c.tau,
                 indicator=c.indicator,
+                geometry=geo,
             )
-            m_v = _train_gang_m_vhat(data.a_hat, data.adjacency, patterns, c.tau)
+            m_v = _train_gang_m_vhat(
+                data.a_hat, data.adjacency, patterns, c.tau, geometry=geo
+            )
             from src.run_collective_bank_detection import _collective_gamma
 
-            g = _collective_gamma(data.a_hat, basis, m_v, c.ridge, c.tau)
+            g = _collective_gamma(
+                data.a_hat, basis, m_v, c.ridge, c.tau, geometry=geo
+            )
             diag = torch.diagonal(g).clamp(0.0, 1.0)
             return {
                 "per_gang_capture": [float(v) for v in diag],
@@ -502,6 +565,7 @@ class CollectiveBankDetector:
             c.tau,
             indicator=c.indicator,
             basis=c.basis,
+            geometry=geo,
         )
 
     def gram_condition(self, data: GraphData) -> dict:
@@ -509,12 +573,13 @@ class CollectiveBankDetector:
 
         self._require_fit()
         c = self.config
+        geo = self.geometry(data)
         return {
             "chebyshev": channel_gram_cond(
-                data.a_hat, data.X, self.theta_, c.tau, "chebyshev"
+                data.a_hat, data.X, self.theta_, c.tau, "chebyshev", geometry=geo
             ),
             "monomial": channel_gram_cond(
-                data.a_hat, data.X, self.theta_, c.tau, "monomial"
+                data.a_hat, data.X, self.theta_, c.tau, "monomial", geometry=geo
             ),
         }
 
@@ -528,6 +593,18 @@ class CollectiveBankDetector:
         """
 
         c = self.config
+        if c.coarsening_method == "dual-ward" and c.coarsening_laplacian in (
+            "combinatorial",
+            "comb",
+        ):
+            # src.smooth_dual_ward scores merges in M_tau = L_sym + tau I only;
+            # pairing it with a combinatorial target would coarsen in a different
+            # metric than the one the target and the RSA budget are stated in.
+            raise NotImplementedError(
+                "coarsening_method='dual-ward' is symmetric-only (it scores merges "
+                "in L_sym + tau I); use 'ward-tree', 'ward' or the greedy methods "
+                "with coarsening_laplacian='combinatorial'."
+            )
         if c.coarsening_method == "ward-tree":
             return ward_tree_coarsen(
                 data.adjacency,
@@ -638,6 +715,28 @@ class CollectiveBankDetector:
         }
 
     # -- misc --------------------------------------------------------------- #
+    def _require_symmetric(self, what: str) -> None:
+        """Refuse the code paths whose geometry is still hard-coded symmetric.
+
+        ``src.margin_pencil`` (the ``closed-form`` and ``aeq`` solvers) and
+        ``src.trace_ratio_bank`` build their own degree-weighted indicators and
+        local ``M_tau`` forms internally.  Running them under
+        ``coarsening_laplacian="combinatorial"`` would train in one geometry and
+        coarsen/report in another -- silently, and with a plausible-looking
+        number at the end.  Failing loudly is the only honest option until those
+        modules take a geometry too.
+        """
+
+        if self.config.coarsening_laplacian in ("combinatorial", "comb"):
+            raise NotImplementedError(
+                f"collective_solver={what!r} is not geometry-aware yet: it builds "
+                "degree-weighted indicators internally and would train in the "
+                "symmetric metric while the coarsening and the reported capture "
+                "use the combinatorial one.  Use collective_solver='gradient' "
+                "with coarsening_laplacian='combinatorial', or keep "
+                "coarsening_laplacian='symmetric' for this solver."
+            )
+
     def _require_fit(self) -> None:
         if self.theta_ is None:
             raise RuntimeError("call fit(data, train_patterns) before this step")

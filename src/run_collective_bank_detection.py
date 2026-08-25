@@ -402,6 +402,23 @@ def make_negative_sampler(
 # --------------------------------------------------------------------------- #
 # 3-4.  collective L_sym filter-bank learning
 # --------------------------------------------------------------------------- #
+def _geometry_or_symmetric(geometry, a_hat: torch.Tensor, adjacency: torch.Tensor):
+    """The caller's :class:`~src.screened_geometry.ScreenedGeometry`, or the default.
+
+    Every geometry-aware helper below takes ``geometry=None`` and funnels through
+    here, so omitting it reproduces the historical symmetric behaviour
+    (``L = I - A_hat``, degree-weighted ``v_S``, propagation on ``A_hat``)
+    bit-for-bit -- the combinatorial convention is opt-in and never leaks into a
+    call site that did not ask for it.
+    """
+
+    if geometry is not None:
+        return geometry
+    from src.screened_geometry import symmetric_geometry
+
+    return symmetric_geometry(a_hat, adjacency)
+
+
 def _degree_weighted_columns(
     adjacency: torch.Tensor, node_sets: "list"
 ) -> torch.Tensor:
@@ -410,6 +427,11 @@ def _degree_weighted_columns(
     ``D_tilde = D + I`` matches the self-loop renormalization of ``A_hat``, so
     ``||v_S||_L^2 = Phi(S)`` under ``L = I - A_hat``.  ``node_sets`` is any list of
     node-index sequences (planted gangs or sampled negatives).
+
+    This is the *symmetric* convention, hard-coded.  Geometry-aware code should
+    call :meth:`src.screened_geometry.ScreenedGeometry.indicator_columns`
+    instead, which returns this under ``kind="symmetric"`` and the uniform
+    ``v_S = 1_S/sqrt(|S|)`` under ``kind="combinatorial"``.
     """
 
     n = adjacency.shape[0]
@@ -432,7 +454,11 @@ def degree_weighted_indicators(adjacency: torch.Tensor, patterns: list) -> torch
 
 
 def _l_apply(a_hat: torch.Tensor, signals: torch.Tensor) -> torch.Tensor:
-    """Apply ``L = I - A_hat`` to dense ``signals`` (columns are graph signals)."""
+    """Apply ``L = I - A_hat`` to dense ``signals`` (columns are graph signals).
+
+    The *symmetric* convention, hard-coded; geometry-aware code calls
+    :meth:`src.screened_geometry.ScreenedGeometry.l_apply` instead.
+    """
 
     return signals - torch.sparse.mm(a_hat, signals)
 
@@ -444,6 +470,9 @@ def _m_apply(a_hat: torch.Tensor, signals: torch.Tensor, tau: float) -> torch.Te
     positive *definite* (a true norm) and adds ``tau*||x||_2^2`` of within-supernode
     (l2) energy to every inner product, per the screened-metric family
     ``||x||_{M_tau}^2 = ||x||_L^2 + tau*||x||_2^2``.
+
+    The *symmetric* convention, hard-coded; geometry-aware code calls
+    :meth:`src.screened_geometry.ScreenedGeometry.m_apply` instead.
     """
 
     out = _l_apply(a_hat, signals)
@@ -487,7 +516,7 @@ def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch
 
 
 def lanczos_stack(
-    a_hat: torch.Tensor, X: torch.Tensor, degree: int, tau: float
+    a_hat: torch.Tensor, X: torch.Tensor, degree: int, tau: float, geometry=None
 ) -> list[torch.Tensor]:
     """Per-channel ``M_tau``-orthonormal Krylov basis ``q_k = p_k(A_hat) x_j``.
 
@@ -525,7 +554,8 @@ def lanczos_stack(
         inv = torch.where(nrm > tol, 1.0 / nrm.clamp_min(eps), torch.zeros_like(nrm))
         return v * inv.unsqueeze(0), mv * inv.unsqueeze(0), nrm
 
-    q, mq, _ = _unit(X, _m_apply(a_hat, X, tau))
+    geo = _geometry_or_symmetric(geometry, a_hat, None)
+    q, mq, _ = _unit(X, geo.m_apply(X, tau))
     Q, MQ = [q], [mq]
     beta = torch.zeros(X.shape[1], dtype=X.dtype, device=X.device)
     for k in range(degree):
@@ -535,14 +565,19 @@ def lanczos_stack(
             w = w - beta.unsqueeze(0) * Q[-2]  # - beta_k q_{k-1}
         for Qi, MQi in zip(Q, MQ):  # full reorthogonalization (cached M_tau q_i)
             w = w - (w * MQi).sum(0).unsqueeze(0) * Qi
-        q, mq, beta = _unit(w, _m_apply(a_hat, w, tau))
+        q, mq, beta = _unit(w, geo.m_apply(w, tau))
         Q.append(q)
         MQ.append(mq)
     return Q
 
 
 def _basis_stack(
-    a_hat: torch.Tensor, X: torch.Tensor, degree: int, basis: str, tau: float = 0.0
+    a_hat: torch.Tensor,
+    X: torch.Tensor,
+    degree: int,
+    basis: str,
+    tau: float = 0.0,
+    geometry=None,
 ) -> list[torch.Tensor]:
     """Dictionary the filter bank is built on: monomial ``A_hat^k X`` or Chebyshev.
 
@@ -580,7 +615,7 @@ def _basis_stack(
     if basis == "monomial":
         return propagation_stack(a_hat, X, degree)
     if basis == "lanczos":
-        return lanczos_stack(a_hat, X, degree, tau)
+        return lanczos_stack(a_hat, X, degree, tau, geometry=geometry)
     raise ValueError("basis must be 'chebyshev', 'monomial' or 'lanczos'")
 
 
@@ -590,6 +625,7 @@ def _collective_gamma(
     m_vhat: torch.Tensor,
     ridge: float,
     tau: float,
+    geometry=None,
 ) -> torch.Tensor:
     """Collective ``M_tau``-Gram ``Gamma = Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat``.
 
@@ -600,8 +636,9 @@ def _collective_gamma(
     ``screening is a ridge on the Gram``.  A small ``ridge`` adds a further guard.
     """
 
-    m_z = _m_apply(a_hat, Z, tau)  # M_tau Z          (N, d)
-    return _collective_gamma_mz(Z, m_z, m_vhat, ridge)
+    geo = _geometry_or_symmetric(geometry, a_hat, None)
+    m_z = geo.m_apply(Z, tau)  # M_tau Z          (N, d)
+    return _collective_gamma_mz(Z, m_z, m_vhat, ridge * geo.ridge_scale)
 
 
 def _collective_gamma_mz(
@@ -754,35 +791,46 @@ def build_confusability_tables(
     basis: str = "chebyshev",
     delta: float = 0.0,
     halo_hops: int = 1,
+    geometry=None,
 ) -> list:
     """Precompute the per-gang, ``Theta``-independent pieces of the confusability.
 
     With ``delta == 0`` (the default, hard confusability eq. 36) each gang ``S``
     gets the S-localized Chebyshev table ``Y_S in R^{(K+1) x s x d}``,
-    ``(Y_S)_{k,i,a} = (M_tau T_k(A_hat) x_a)_i sqrt(d_tilde_i)``, the exact local
-    ``M_tau``-form ``Q_S^tau = L^int_S + diag(d_partial) + tau * D_tilde_S``, and
-    ``d_tilde|_S`` for the mean-zero constraint ``sum_i d_tilde_i z_i = 0``.
+    ``(Y_S)_{k,i,a} = (M_tau T_k(P) x_a)_i * weight_i``, the exact local
+    ``M_tau``-form ``Q_S^tau = L^int_S + diag(d_partial) + tau * diag(weight^2)``,
+    and ``weight^2|_S`` for the mean-zero constraint ``sum_i weight_i^2 z_i = 0``.
+
+    ``weight`` is the coordinate change ``w = diag(weight) z`` that makes the
+    fluctuation ``w`` supported on ``S`` and comes from ``geometry``:
+    ``sqrt(d_tilde_i)`` under the symmetric convention (so ``Q_S`` picks up
+    ``tau * D_tilde_S`` and the constraint is ``sum_i d_tilde_i z_i = 0``) and
+    ``1`` under the combinatorial one (``Q_S = M_tau[S, S]`` exactly, constraint
+    ``sum_i z_i = 0``).  The Laplacian part ``L^int_S + diag(d_partial)`` is the
+    same quadratic form either way, which is why only these two pieces move.
 
     With ``delta > 0`` (the delta-leaky cone, Definitions 4.4/4.6) the confuser may
     place up to a ``delta`` fraction of its ell2 mass *outside* ``S`` -- in the
     ``halo_hops``-hop halo ``H = S union boundary(S)`` (the r-hop confuser of Remark
     4.12).  Each gang then gets the *halo*-localized table ``Y_H`` (no degree
-    weighting -- ``w``-coordinates), the local ``M_tau`` form on the halo
-    ``B_H = (1+tau) I - A_hat[H,H]`` (so ``w^T B_H w = ||w||^2_{M_tau}`` for signals
-    supported on ``H``), the ell2 orthogonality vector ``c`` (``c_i = sqrt(d_tilde_i)``
-    on ``S``, ``0`` on the halo so that ``c^T w = <w, v_S>_{l2}``), and a boolean
-    ``leak_mask`` marking the halo (outside-``S``) coordinates.  None depend on the
-    learned filter, so they are built once and reused every epoch.
+    weighting -- ``w``-coordinates), the principal submatrix of ``M_tau`` on the
+    halo ``B_H`` (so ``w^T B_H w = ||w||^2_{M_tau}`` for signals supported on
+    ``H``; ``(1+tau) I - A_hat[H,H]`` under the symmetric convention and
+    ``(D - W + tau I)[H,H]`` under the combinatorial one), the ell2 orthogonality
+    vector ``c`` (``geometry.node_weights`` on ``S``, ``0`` on the halo, so that
+    ``c^T w = <w, v_S>_{l2}``), and a boolean ``leak_mask`` marking the halo
+    (outside-``S``) coordinates.  None depend on the learned filter, so they are
+    built once and reused every epoch.
     """
 
-    dtype, device = a_hat.dtype, a_hat.device
-    # M_tau phi_k(A_hat) X for k=0..K, shared across gangs (Theta-independent).
-    propagated = _basis_stack(a_hat, X, degree, basis, tau)
-    m_prop = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    dtype, device = X.dtype, X.device
+    # M_tau phi_k(P) X for k=0..K, shared across gangs (Theta-independent).
+    propagated = _basis_stack(geo.prop, X, degree, basis, tau, geometry=geo)
+    m_prop = [geo.m_apply(propagated[k], tau) for k in range(degree + 1)]
 
     d_total = _degrees(adjacency)  # (N,) weighted degree (no self-loops in W)
-    d_tilde_all = d_total + 1.0  # self-loop augmented degree D_tilde = D + I
-    n = a_hat.shape[0]
+    n = adjacency.shape[0]
     coalesced = adjacency.coalesce()
     ii, jj = coalesced.indices()
     vv = coalesced.values()
@@ -790,7 +838,7 @@ def build_confusability_tables(
 
     if delta > 0.0:
         return _build_leaky_tables(
-            a_hat, m_prop, d_tilde_all, patterns, tau, delta, halo_hops, degree
+            a_hat, m_prop, patterns, tau, delta, halo_hops, degree, geometry=geo
         )
 
     tables = []
@@ -807,28 +855,37 @@ def build_confusability_tables(
         d_int = w_sub.sum(1)  # internal degree
         d_tot_s = d_total[nodes].to(dtype)
         d_bnd = (d_tot_s - d_int).clamp_min(0.0)  # boundary degree d_partial
-        d_tilde = d_tilde_all[nodes].to(dtype)
+        # The Laplacian part of the local M_tau form is convention-free: for w
+        # supported on S, w^T L w = w^T (L^int_S + diag(d_partial)) w for BOTH
+        # L = D - W and L = I - A_hat (the latter after the w = D_tilde^{1/2} z
+        # change of variables).  Only the screening term and the coordinate
+        # weight carry the geometry, so both come from ``geo``.
+        weight = geo.node_weights(nodes).to(dtype)  # sqrt(d_tilde) | 1
         q = (
             (torch.diag(d_int) - w_sub)  # L^int_S
             + torch.diag(d_bnd)  # diag(d_partial)
-            + tau * torch.diag(d_tilde)  # tau * D_tilde_S
+            + tau * torch.diag(geo.screening_diagonal(nodes).to(dtype))  # tau*D_tilde|tau*I
         )
         q = 0.5 * (q + q.T)
-        sqrt_dt = d_tilde.sqrt().unsqueeze(1)  # (s, 1)
-        # Y[k] = (M_tau phi_k X)[S] * sqrt(d_tilde_S)   -> (K+1, s, d)
-        Y = torch.stack([m_prop[k][nodes] * sqrt_dt for k in range(degree + 1)], dim=0)
-        tables.append({"Y": Y, "Q": q, "dtilde": d_tilde})
+        # Y[k] = (M_tau phi_k X)[S] * weight   -> (K+1, s, d)
+        Y = torch.stack(
+            [m_prop[k][nodes] * weight.unsqueeze(1) for k in range(degree + 1)], dim=0
+        )
+        # constraint vector of F_S: <w, v_S>_2 = 0 <=> sum_i weight_i^2 z_i = 0
+        tables.append({"Y": Y, "Q": q, "dtilde": weight**2})
     return tables
 
 
 def _build_leaky_tables(
-    a_hat, m_prop, d_tilde_all, patterns, tau, delta, halo_hops, degree
+    a_hat, m_prop, patterns, tau, delta, halo_hops, degree, *, geometry=None
 ):
     """Per-gang halo tables for the delta-leaky cone (Definitions 4.4/4.6)."""
 
-    dtype, device = a_hat.dtype, a_hat.device
+    geo = _geometry_or_symmetric(geometry, a_hat, None)
+    combinatorial = geo.kind == "combinatorial"
+    dtype, device = m_prop[0].dtype, m_prop[0].device
     n = a_hat.shape[0]
-    a_coo = a_hat.coalesce()
+    a_coo = (geo.adjacency if combinatorial else a_hat).coalesce()
     ai, aj = a_coo.indices()
     av = a_coo.values()
     pos = torch.full((n,), -1, dtype=torch.long, device=device)
@@ -846,17 +903,23 @@ def _build_leaky_tables(
         core_local = pos[core]
         leak_mask = torch.ones(h, dtype=torch.bool, device=device)
         leak_mask[core_local] = False  # True on the halo (outside-S) coordinates
-        # A_hat[H, H] sub-block (normalized adjacency, includes self-loops)
+        # local M_tau form on the halo: ||w||^2_{M_tau} = w^T B_H w for any w
+        # supported on H -- the principal submatrix of M_tau on H either way.
         m = (pos[ai] >= 0) & (pos[aj] >= 0)
-        a_hh = torch.zeros(h, h, dtype=dtype, device=device)
-        a_hh[pos[ai[m]], pos[aj[m]]] = av[m].to(dtype)
-        a_hh = 0.5 * (a_hh + a_hh.T)
-        # local M_tau form on the halo: ||w||^2_{M_tau} = w^T B_H w
-        b_h = (1.0 + tau) * torch.eye(h, dtype=dtype, device=device) - a_hh
+        sub_hh = torch.zeros(h, h, dtype=dtype, device=device)
+        sub_hh[pos[ai[m]], pos[aj[m]]] = av[m].to(dtype)
+        sub_hh = 0.5 * (sub_hh + sub_hh.T)
+        if combinatorial:
+            # (D - W + tau I)[H, H]: the diagonal is the FULL degree (edges to
+            # outside H included), which is what makes this the exact restriction.
+            deg_h = _degrees(geo.adjacency)[halo].to(dtype)
+            b_h = torch.diag(deg_h + tau) - sub_hh
+        else:
+            b_h = (1.0 + tau) * torch.eye(h, dtype=dtype, device=device) - sub_hh
         b_h = 0.5 * (b_h + b_h.T)
-        # ell2 orthogonality to v_S: c^T w = <w, v_S>_{l2}, v_S ~ D_tilde^{1/2} 1_S
+        # ell2 orthogonality to v_S: c^T w = <w, v_S>_{l2}
         c = torch.zeros(h, dtype=dtype, device=device)
-        c[core_local] = d_tilde_all[core].to(dtype).sqrt()
+        c[core_local] = geo.node_weights(core).to(dtype)
         # halo-localized bank table in w-coordinates (no degree weighting)
         Y = torch.stack([m_prop[k][halo] for k in range(degree + 1)], dim=0)
         tables.append(
@@ -1115,6 +1178,7 @@ def collective_confusability(
     reduce: str = "max",
     m_z: "torch.Tensor | None" = None,
     chol: "torch.Tensor | None" = None,
+    geometry=None,
 ) -> torch.Tensor:
     """Worst-gang confusability ``max_{j<=m} chi^tau_{R_Theta}(S_j)`` (eq. 40 term).
 
@@ -1135,7 +1199,7 @@ def collective_confusability(
     # G_Z(Theta) whether chol is precomputed or built here.
     if chol is None:
         if m_z is None:
-            m_z = _m_apply(a_hat, Z, tau)
+            m_z = _geometry_or_symmetric(geometry, a_hat, None).m_apply(Z, tau)
         g_z = Z.T @ m_z
         g_z = 0.5 * (g_z + g_z.T)
         d = g_z.shape[0]
@@ -1209,6 +1273,7 @@ def _graph_bundle(
     conf_delta: float,
     conf_halo_hops: int,
     keep_dense: bool,
+    geometry=None,
 ) -> dict:
     """All ``O(N)`` work for ONE graph, precomputed once.
 
@@ -1229,17 +1294,22 @@ def _graph_bundle(
     """
 
     eps = torch.finfo(X.dtype).eps
-    V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
-    l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2 (conductance)
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    # v_j is unit-l2 in BOTH geometries (degree-weighted / uniform, per ``geo``),
+    # so Phi_j = ||v_j||_L^2 is the conductance cut/vol in the symmetric case and
+    # the cardinality-normalized cut/|S| of the paper's eq. 1-2 in the
+    # combinatorial one -- and the vhat normalization below is the same formula.
+    V = geo.indicators(train_patterns)  # (N, m)
+    l_v = geo.l_apply(V)
+    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
     m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau} = sqrt(Phi_j + tau)
     m_vhat = (l_v + tau * V) / m_norm  # M_tau Vhat = (L + tau I) v_j / sqrt(Phi_j+tau)
 
-    propagated = _basis_stack(a_hat, X, degree, basis, tau)  # [phi_k(A_hat) X], k=0..K
-    # Screened dictionary stack [M_tau phi_k(A_hat) X] (K+1 sparse mat-vecs).  M_tau Z
+    propagated = _basis_stack(geo.prop, X, degree, basis, tau, geometry=geo)
+    # Screened dictionary stack [M_tau phi_k(P) X] (K+1 sparse mat-vecs).  M_tau Z
     # is linear in theta, so M_tau Z = _filtered_bank(m_prop, theta) each epoch -- no
     # per-epoch sparse mat-vec in the Gram/confusability.
-    m_propagated = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
+    m_propagated = [geo.m_apply(propagated[k], tau) for k in range(degree + 1)]
 
     # N-independent Gram kernel.  The screened channel Gram and the RHS are
     # quadratic / linear in the per-channel filter ``theta`` with theta-independent
@@ -1264,8 +1334,8 @@ def _graph_bundle(
 
     rhs_test_kernel = None
     if test_patterns:
-        v_t = degree_weighted_indicators(adjacency, test_patterns)
-        l_vt = _l_apply(a_hat, v_t)
+        v_t = geo.indicators(test_patterns)
+        l_vt = geo.l_apply(v_t)
         phi_t = (v_t * l_vt).sum(0).clamp_min(eps)
         m_vt = (l_vt + tau * v_t) / (phi_t + tau).sqrt().unsqueeze(0)
         rhs_test_kernel = (_pr.T @ m_vt).reshape(degree + 1, d_feat, -1)
@@ -1282,6 +1352,7 @@ def _graph_bundle(
             basis=basis,
             delta=conf_delta,
             halo_hops=conf_halo_hops,
+            geometry=geo,
         )
         if conf_active and train_patterns
         else []
@@ -1290,6 +1361,7 @@ def _graph_bundle(
     return {
         "label": label,
         "a_hat": a_hat,
+        "geometry": geo,
         "adjacency": adjacency,
         "X": X,
         "patterns": train_patterns,
@@ -1337,6 +1409,7 @@ def fit_collective_bank(
     heads: int = 1,
     head_diversity: float = 0.0,
     day_aggregate: str = "sample",
+    geometries: "list | None" = None,
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -1410,6 +1483,12 @@ def fit_collective_bank(
     ``-head_diversity * mean_{h<h'} <theta_h, theta_h'>^2`` (mean squared cosine
     between heads' per-channel filters) to the ascended objective.
 
+    ``geometries`` is the per-graph :class:`~src.screened_geometry.ScreenedGeometry`
+    (same length and order as ``days``), which fixes the screened metric
+    ``M_tau``, the group indicator ``v_S``, and the operator the bank propagates
+    on.  ``None`` means the symmetric default for every graph, i.e. exactly the
+    behaviour that predates the combinatorial option.
+
     Returns the learned ``theta`` (``(H, K+1, d)``, unit per-(head, channel)
     columns) plus the initial and final objective and the optimization history,
     with a per-graph breakdown of the final objective in ``per_day``.
@@ -1419,6 +1498,11 @@ def fit_collective_bank(
         raise ValueError("days must be a non-empty list of graph specs")
     if day_aggregate not in ("sample", "mean", "min"):
         raise ValueError("day_aggregate must be 'sample', 'mean' or 'min'")
+    if geometries is not None and len(geometries) != len(days):
+        raise ValueError(
+            f"geometries has {len(geometries)} entries but {len(days)} graphs "
+            "were given; pass one geometry per graph (or None for all-symmetric)."
+        )
     heads = max(1, int(heads))
 
     # negative "repeller" sets: their softmax-lambda_max is *minimized*, so ``R``
@@ -1474,6 +1558,7 @@ def fit_collective_bank(
                 label, a_hat_i, adjacency_i, patterns_i, X_i, test_i,
                 degree=degree, tau=tau, basis=basis, conf_active=conf_active,
                 conf_delta=conf_delta, conf_halo_hops=conf_halo_hops,
+                geometry=(geometries[i] if geometries is not None else None),
                 # the dense stacks are only ever read on the first graph (initial
                 # objective) and by the single-graph negatives / label head
                 keep_dense=(i == 0),
@@ -1487,13 +1572,19 @@ def fit_collective_bank(
 
     # the graph the O(N) initial objective and the single-graph features read
     first = bundles[0]
-    ridge_eye = ridge * torch.eye(n_col, dtype=dtype, device=device)
+    # The absolute ridge on Z^T M_tau Z is carried into each graph's own metric
+    # scale -- per graph, since lambda_max(D - W) differs day to day.  A no-op in
+    # the symmetric geometry, where ridge_scale is exactly 1 (see
+    # ScreenedGeometry.ridge_scale).
+    eye_n_col = torch.eye(n_col, dtype=dtype, device=device)
+    for bundle in bundles:
+        bundle["ridge_eye"] = (ridge * bundle["geometry"].ridge_scale) * eye_n_col
 
     def _neg_l_vhat(sets: "list | None"):
         if not sets:
             return None
-        v_neg = _degree_weighted_columns(first["adjacency"], sets)
-        l_v_neg = _l_apply(first["a_hat"], v_neg)
+        v_neg = first["geometry"].indicator_columns(sets)
+        l_v_neg = first["geometry"].l_apply(v_neg)
         phi_neg = (v_neg * l_v_neg).sum(0).clamp_min(eps)
         return (l_v_neg + tau * v_neg) / (phi_neg + tau).sqrt().unsqueeze(0)
 
@@ -1511,7 +1602,7 @@ def fit_collective_bank(
         ).reshape(n_col, n_col)
         g_z = 0.5 * (g_z + g_z.T)
         m = torch.einsum("hka,kaj->haj", th, bundle[rhs_key]).reshape(n_col, -1)
-        chol = torch.linalg.cholesky(g_z + ridge_eye)
+        chol = torch.linalg.cholesky(g_z + bundle["ridge_eye"])
         gamma = m.T @ torch.cholesky_solve(m, chol)  # Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat
         return 0.5 * (gamma + gamma.T), chol
 
@@ -1603,7 +1694,10 @@ def fit_collective_bank(
         gamma_neg = (
             _collective_gamma_mz(embedding, m_z, l_vhat_neg, ridge)
             if m_z is not None
-            else _collective_gamma(first["a_hat"], embedding, l_vhat_neg, ridge, tau)
+            else _collective_gamma(
+                first["a_hat"], embedding, l_vhat_neg, ridge, tau,
+                geometry=first["geometry"],
+            )
         )
         return _soft_lambda_max(gamma_neg, neg_temperature, sharpen=neg_sharpen)
 
@@ -1613,7 +1707,8 @@ def fit_collective_bank(
         init_obj = float(
             torch.linalg.eigvalsh(
                 _collective_gamma(
-                    first["a_hat"], Z0, first["m_vhat"], ridge, tau
+                    first["a_hat"], Z0, first["m_vhat"], ridge, tau,
+                    geometry=first["geometry"],
                 )
             )[0]
         )
@@ -1986,6 +2081,7 @@ def channel_gram_cond(
     theta: torch.Tensor,
     tau: float,
     basis: str,
+    geometry=None,
 ) -> float:
     """Condition number ``kappa`` of the screened channel Gram ``Z^T M_tau Z``.
 
@@ -1996,9 +2092,10 @@ def channel_gram_cond(
     solve needs no ridge and trains stably at large ``K``).
     """
 
-    propagated = _basis_stack(a_hat, X, theta_degree(theta), basis, tau)
+    geo = _geometry_or_symmetric(geometry, a_hat, None)
+    propagated = _basis_stack(geo.prop, X, theta_degree(theta), basis, tau, geometry=geo)
     Z = _filtered_bank(propagated, theta)
-    g_z = Z.T @ _m_apply(a_hat, Z, tau)
+    g_z = Z.T @ geo.m_apply(Z, tau)
     g_z = 0.5 * (g_z + g_z.T)
     eigs = torch.linalg.eigvalsh(g_z)
     lo = (
@@ -2019,6 +2116,7 @@ def build_bank_subspace(
     seed: int | None = None,
     coarsen_target: str = "bank",
     basis: str = "chebyshev",
+    geometry=None,
 ) -> torch.Tensor:
     """Target ``R`` handed to the coarsener.
 
@@ -2055,24 +2153,27 @@ def build_bank_subspace(
     reconstruct them.  ``structural_width = 0`` leaves the target unchanged.
     """
 
-    propagated = _basis_stack(a_hat, X, theta_degree(theta), basis, tau)
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    propagated = _basis_stack(geo.prop, X, theta_degree(theta), basis, tau, geometry=geo)
     Z = _filtered_bank(propagated, theta)  # (N, d)
 
     if coarsen_target == "bank":
         target = Z  # R = span(Z), the full learned filter-bank subspace     (N, d)
     elif coarsen_target == "indicators":
-        eps = torch.finfo(a_hat.dtype).eps
-        V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
-        l_v = _l_apply(a_hat, V)
+        eps = torch.finfo(X.dtype).eps
+        V = geo.indicators(train_patterns)  # (N, m)
+        l_v = geo.l_apply(V)
         phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
         m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau}
         m_vhat = (l_v + tau * V) / m_norm  # M_tau v_hat_j                     (N, m)
-        m_z = _m_apply(a_hat, Z, tau)  # M_tau Z                             (N, d)
+        m_z = geo.m_apply(Z, tau)  # M_tau Z                                 (N, d)
         g_z = Z.T @ m_z  # Z^T M_tau Z                                       (d, d)
         g_z = 0.5 * (g_z + g_z.T)
         rhs = Z.T @ m_vhat  # Z^T M_tau v_hat                                (d, m)
         eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
-        coeffs = torch.linalg.solve(g_z + ridge * eye, rhs)  # (Z^T M Z)^+ Z^T M v_hat
+        coeffs = torch.linalg.solve(
+            g_z + (ridge * geo.ridge_scale) * eye, rhs
+        )  # (Z^T M Z)^+ Z^T M v_hat
         target = Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                     (N, m)
     elif coarsen_target in ("dictionary", "bank+dictionary"):
         # Theorem 6.2 closed form: project each v_hat_j onto the FULL dictionary
@@ -2082,13 +2183,13 @@ def build_bank_subspace(
         # ceiling of Theorem 6.5 -- the best capture ANY degree-K filter of these
         # features can give that gang.  theta plays no role here beyond fixing
         # K and the polynomial basis.
-        eps = torch.finfo(a_hat.dtype).eps
-        V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
-        l_v = _l_apply(a_hat, V)
+        eps = torch.finfo(X.dtype).eps
+        V = geo.indicators(train_patterns)  # (N, m)
+        l_v = geo.l_apply(V)
         phi = (V * l_v).sum(0).clamp_min(eps)
         m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)  # (N, m)
         B = torch.cat(propagated, dim=1)  # (N, (K+1)d)
-        m_b = _m_apply(a_hat, B, tau)
+        m_b = geo.m_apply(B, tau)
         gram = B.T @ m_b
         gram = 0.5 * (gram + gram.T)
         rhs = B.T @ m_vhat  # ((K+1)d, m)
@@ -2124,7 +2225,9 @@ def build_bank_subspace(
             generator=gen,
         )
         theta_bar = as_multihead(theta).mean(dim=(0, 2))  # (K+1,) mean over heads+channels
-        prop_struct = _basis_stack(a_hat, omega, theta_bar.shape[0] - 1, basis, tau)
+        prop_struct = _basis_stack(
+            geo.prop, omega, theta_bar.shape[0] - 1, basis, tau, geometry=geo
+        )
         z_struct = _filtered_bank(prop_struct, theta_bar)  # (N, structural_width)
         target = torch.cat([target, z_struct], dim=1)  # (N, m + structural_width)
     return target
@@ -2140,16 +2243,20 @@ def retained_energy(
     tau: float = 0.0,
     indicator: str = "degree_weighted",
     basis: str = "chebyshev",
+    geometry=None,
 ) -> dict:
     """Per-gang retained ``M_tau``-energy ``C_S = Gamma_jj`` and the collective margin.
 
     ``indicator`` selects the gang signal (see :func:`_make_indicators`).
     """
 
-    _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
-    propagated = _basis_stack(a_hat, X, theta_degree(theta), basis, tau)
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    _, m_vhat = _make_indicators(
+        a_hat, adjacency, patterns, tau, indicator, geometry=geo
+    )
+    propagated = _basis_stack(geo.prop, X, theta_degree(theta), basis, tau, geometry=geo)
     Z = _filtered_bank(propagated, theta)
-    gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
+    gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau, geometry=geo)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
     return {
         "per_gang_capture": [float(v) for v in diag],
@@ -2177,34 +2284,49 @@ def _make_indicators(
     patterns: list,
     tau: float,
     indicator: str = "degree_weighted",
+    geometry=None,
 ) -> tuple:
     """Build ``V`` and the precomputed ``M_tau Vhat`` for the chosen indicator.
 
-    ``indicator='degree_weighted'`` uses ``v_S = D_tilde^{1/2} 1_S / sqrt(vol(S))``
-    (conductance-normalized, matches the training objective).
+    ``indicator='geometry'`` (what every geometry-aware caller passes) takes the
+    indicator from the screened geometry itself, so the *reported* capture is
+    measured on the same signal the training objective ascended:
+    ``v_S = D_tilde^{1/2} 1_S / sqrt(vol(S))`` under the symmetric convention and
+    ``v_S = 1_S / sqrt(|S|)`` under the combinatorial one.  This is the setting
+    that cannot silently disagree with the fit.
 
-    ``indicator='plain'`` uses the raw 0/1 membership vector ``1_S`` normalized
-    to unit ``M_tau``-energy: ``||1_S||_{M_tau}^2 = 1_S^T L 1_S + tau*|S|``.
-    Both choices yield ``||vhat||_{M_tau} = 1``; the difference is what notion
-    of "which nodes belong to the gang" is privileged.
+    ``indicator='degree_weighted'`` and ``indicator='plain'`` pin the signal
+    explicitly, whatever the geometry: the conductance-normalized
+    ``D_tilde^{1/2} 1_S / sqrt(vol(S))`` and the raw 0/1 membership vector
+    normalized to unit ``M_tau``-energy (``||1_S||_{M_tau}^2 = 1_S^T L 1_S +
+    tau*|S|``).  All three yield ``||vhat||_{M_tau} = 1``; the difference is what
+    notion of "which nodes belong to the gang" is privileged.  Pinning is useful
+    for cross-geometry reporting -- the same signal scored in two metrics -- but
+    ``'degree_weighted'`` under a combinatorial fit reports a capture the filter
+    never optimized.
 
     Returns ``(V, m_vhat)`` where ``V`` is ``(N, m)`` unnormalized and
     ``m_vhat = M_tau Vhat`` is ``(N, m)``.
     """
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
     n = a_hat.shape[0]
     eps = torch.finfo(a_hat.dtype).eps
     if indicator == "plain":
         V = torch.zeros(n, len(patterns), dtype=a_hat.dtype, device=a_hat.device)
         for j, p in enumerate(patterns):
             V[list(p.node_indices), j] = 1.0
-        l_v = _l_apply(a_hat, V)
+        l_v = geo.l_apply(V)
         phi = (V * l_v).sum(0)  # 1_S^T L 1_S
         sq = (V * V).sum(0)  # |S|
         denom = (phi + tau * sq).clamp_min(eps)
         m_vhat = (l_v + tau * V) / denom.sqrt().unsqueeze(0)
-    else:  # degree_weighted (default)
-        V = degree_weighted_indicators(adjacency, patterns)
-        l_v = _l_apply(a_hat, V)
+    else:  # "geometry" (the geometry's own v_S) or "degree_weighted" (pinned)
+        V = (
+            geo.indicators(patterns)
+            if indicator == "geometry"
+            else degree_weighted_indicators(adjacency, patterns)
+        )
+        l_v = geo.l_apply(V)
         phi = (V * l_v).sum(0).clamp_min(eps)
         m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)
     return V, m_vhat
@@ -2218,6 +2340,7 @@ def _basis_retained_energy(
     ridge,
     tau,
     indicator: str = "degree_weighted",
+    geometry=None,
 ):
     """Mean/min retained ``M_tau``-energy of the gang indicators under ``span(basis)``.
 
@@ -2236,8 +2359,11 @@ def _basis_retained_energy(
 
     if not patterns:
         return {"mean": None, "min": None}
-    _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
-    gamma = _collective_gamma(a_hat, basis, m_vhat, ridge, tau)
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    _, m_vhat = _make_indicators(
+        a_hat, adjacency, patterns, tau, indicator, geometry=geo
+    )
+    gamma = _collective_gamma(a_hat, basis, m_vhat, ridge, tau, geometry=geo)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
     return {"mean": float(diag.mean()), "min": float(diag.min())}
 
@@ -2369,6 +2495,23 @@ def ward_tree_coarsen(
                 best = entry
 
     if best is None:  # even the first combination overshot the budget
+        # Returning the finest cut here means returning an essentially UNcoarsened
+        # graph (one merge) and calling it a result: every gang stays split across
+        # its own nodes, so detection is 0 while precision reads 1.  That is a
+        # silent failure worth naming, and it is the normal outcome when the
+        # budget was calibrated in one geometry and spent in another -- Pi_P is
+        # only Euclidean-orthogonal, so the block-averaging distortion mu_P^tau
+        # <= sqrt((lambda_max + tau)/tau) is ~2.2 under L_sym and orders of
+        # magnitude larger under L = D - W.
+        if trajectory:
+            LOGGER.warning(
+                f"  ward-tree: the FINEST cut (n_coarse={trajectory[0]['n_coarse']:,}) "
+                f"already has epsilon={trajectory[0]['epsilon']:.4g} > budget "
+                f"{epsilon_budget:g}, so no coarsening is feasible and the graph is "
+                f"returned near-uncoarsened.  Raise --epsilon, or switch to "
+                f"--ward-stop f1; note the budget is metric-dependent "
+                f"(laplacian={laplacian!r})."
+            )
         best = trajectory[0] if trajectory else None
     if best is None:
         raise ValueError("ward-tree produced no valid cut")
@@ -2622,13 +2765,22 @@ def train_linear_head(
 
 
 def _train_gang_m_vhat(
-    a_hat: torch.Tensor, adjacency: torch.Tensor, patterns: list, tau: float
+    a_hat: torch.Tensor,
+    adjacency: torch.Tensor,
+    patterns: list,
+    tau: float,
+    geometry=None,
 ) -> torch.Tensor:
-    """``M_tau v_hat_S`` for the training gangs -- the RHS of the collective Gram."""
+    """``M_tau v_hat_S`` for the training gangs -- the RHS of the collective Gram.
+
+    The indicator comes from the geometry, so this matches the RHS kernel
+    :func:`_graph_bundle` precomputes for the fit under either convention.
+    """
 
     eps = torch.finfo(a_hat.dtype).eps
-    V = degree_weighted_indicators(adjacency, patterns)  # (N, m)
-    l_v = _l_apply(a_hat, V)
+    geo = _geometry_or_symmetric(geometry, a_hat, adjacency)
+    V = geo.indicators(patterns)  # (N, m)
+    l_v = geo.l_apply(V)
     phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
     return (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)  # M_tau v_hat_j
 

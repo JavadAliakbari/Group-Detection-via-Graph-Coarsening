@@ -27,6 +27,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -112,26 +113,61 @@ def plot_training_curves(
     a.set_title("training loss")
     a.set_xlabel("epoch")
 
-    # 2. capture: floor, mean, worst gang
+    # 2. capture: floor, mean, worst gang -- ONE LINE PER TRAINING GRAPH.
+    #
+    # Every epoch reports the Gamma of a single graph: the one drawn that step
+    # (day_aggregate="sample") or the one that currently binds the max-min
+    # (day_aggregate="min"/"mean").  Different graphs sit at genuinely different
+    # capture levels, so pooling them into one line turns a switch of *which
+    # graph is being reported* into what looks like violent optimization
+    # instability -- on a 5-graph Elliptic++ fit, ~99% of the pooled variance is
+    # between-graph and the binding graph changes on ~94% of epochs, while each
+    # graph's own trace is smooth and monotone.  Splitting by graph is therefore
+    # not cosmetic: the pooled line answers no question anyone has.
     a = next(ax)
-    a.plot(df.epoch, df.lambda_min, color="#1F4E79", lw=1.6,
-           label="$\\lambda_{\\min}$ train")
-    if "lambda_min_test" in df:
-        a.plot(df.epoch, df.lambda_min_test, color="#1F4E79", lw=1.2, ls=":",
-               label="$\\lambda_{\\min}$ held-out")
-    if "capture_mean" in df:
-        a.plot(df.epoch, df.capture_mean, color="#2E7D5B", lw=1.4,
-               label="mean $C_j$ train")
-    if "capture_mean_test" in df:
-        a.plot(df.epoch, df.capture_mean_test, color="#2E7D5B", lw=1.2, ls=":",
-               label="mean $C_j$ held-out")
-    if "capture_min" in df:
-        a.plot(df.epoch, df.capture_min, color="#2E7D5B", lw=1.0, ls="--",
-               alpha=0.7, label="worst $C_j$ train")
-    a.set_title("capture (retained $M_\\tau$-energy)")
+    multi = "day" in df and df["day"].nunique() > 1
+    if multi:
+        # one colour per graph, one marker per series, so the legend stays short
+        groups = list(df.groupby("day", sort=True))
+        cmap = plt.get_cmap("viridis")
+        handles = []
+        for i, (day, g) in enumerate(groups):
+            color = cmap(i / max(len(groups) - 1, 1))
+            a.plot(g.epoch, g.lambda_min, color=color, marker=".", ms=2.2, ls="none")
+            if "capture_mean" in g:
+                a.plot(g.epoch, g.capture_mean, color=color, marker="x", ms=2.2,
+                       mew=0.6, ls="none")
+            handles.append(mlines.Line2D([], [], color=color, lw=3, label=str(day)))
+        handles += [
+            mlines.Line2D([], [], color="0.35", marker=".", ls="none",
+                          label=r"$\lambda_{\min}$"),
+            mlines.Line2D([], [], color="0.35", marker="x", mew=0.8, ls="none",
+                          label=r"mean $C_j$"),
+        ]
+        a.legend(handles=handles, fontsize=6, frameon=False, ncol=2,
+                 loc="lower right", title="graph", title_fontsize=6)
+    else:
+        a.plot(df.epoch, df.lambda_min, color="#1F4E79", lw=1.6,
+               label=r"$\lambda_{\min}$ train")
+        if "lambda_min_test" in df:
+            a.plot(df.epoch, df.lambda_min_test, color="#1F4E79", lw=1.2, ls=":",
+                   label=r"$\lambda_{\min}$ held-out")
+        if "capture_mean" in df:
+            a.plot(df.epoch, df.capture_mean, color="#2E7D5B", lw=1.4,
+                   label=r"mean $C_j$ train")
+        if "capture_mean_test" in df:
+            a.plot(df.epoch, df.capture_mean_test, color="#2E7D5B", lw=1.2, ls=":",
+                   label=r"mean $C_j$ held-out")
+        if "capture_min" in df:
+            a.plot(df.epoch, df.capture_min, color="#2E7D5B", lw=1.0, ls="--",
+                   alpha=0.7, label=r"worst $C_j$ train")
+        a.legend(fontsize=7, frameon=False)
+    a.set_title(
+        r"capture (retained $M_\tau$-energy)"
+        + ("\nsplit by the graph each epoch reported" if multi else "")
+    )
     a.set_xlabel("epoch")
     a.set_ylabel("capture")
-    a.legend(fontsize=7, frameon=False)
 
     # 3. confusability
     if has_conf:
@@ -142,7 +178,7 @@ def plot_training_curves(
             # soft-min lambda_min - beta*chi - diversity.  NOT mean(C) - chi.
             a.plot(df.epoch, df.objective, color="#B8860B", lw=1.3,
                    label="ascended objective")
-        if "capture_mean" in df:
+        if "capture_mean" in df and not multi:
             a.plot(df.epoch, df.capture_mean - df.confusability, color="#8C8C8C",
                    lw=1.0, ls="--", alpha=0.8, label="mean $C-\\chi$ (not the obj.)")
         a.set_title("confusability and objective")

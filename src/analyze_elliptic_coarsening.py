@@ -48,6 +48,7 @@ from src.collective_detector import CollectiveBankDetector, DetectorConfig, Grap
 from src.loukas_sgc_detection import (
     _degrees,
     _l_orthonormalize,
+    _laplacian,
     _normalized_laplacian,
     _screened_metric,
     evaluate_loukas_patterns,
@@ -403,7 +404,15 @@ def analyze_coarsening(
     n2s,
     normals,
 ):
-    metric = _screened_metric(_normalized_laplacian(data.adjacency), cfg.tau)
+    # the metric must be the one the target basis and the RSA budget are stated
+    # in, or every epsilon reported below belongs to a different geometry than
+    # the coarsening that produced it
+    base_laplacian = (
+        _laplacian
+        if cfg.coarsening_laplacian in ("combinatorial", "comb")
+        else _normalized_laplacian
+    )
+    metric = _screened_metric(base_laplacian(data.adjacency), cfg.tau)
     A = _l_orthonormalize(basis, metric)
     gang_of = torch.full((data.num_nodes,), -1, dtype=torch.long)
     for gi, g in enumerate(gangs):
@@ -507,10 +516,17 @@ def analyze_coarsening(
             else None
         ),
     }
+    # every median here is None when its group is empty -- a coarsening that
+    # detects nothing (or everything) is a legitimate outcome to report, not a
+    # crash, so format defensively.
+    def _fmt(value):
+        return "n/a" if value is None else f"{value:.3f}"
+
     print(
-        f"  [3] conductance: gang supernodes Φ={cond['gang_median_conductance']:.3f} "
-        f"vs bg Φ={cond['background_median_conductance']:.3f}; "
-        f"detected gangs Φ={summary['gang_conductance_detected_vs_missed']['detected_median']}"
+        f"  [3] conductance: gang supernodes Φ={_fmt(cond['gang_median_conductance'])} "
+        f"vs bg Φ={_fmt(cond['background_median_conductance'])}; "
+        f"detected gangs Φ="
+        f"{_fmt(summary['gang_conductance_detected_vs_missed']['detected_median'])}"
     )
 
     # (4) non-gang PR
