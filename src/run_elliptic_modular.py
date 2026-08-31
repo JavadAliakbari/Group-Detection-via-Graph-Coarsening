@@ -315,6 +315,37 @@ def _run_pr_sweep(
     return out
 
 
+def _log_deflated_certificate(coarsening, prefix: str = "  ") -> dict | None:
+    """Log (and return) the RSA sandwich certificate of a deflated coarsening.
+
+    ``None`` for every other coarsener -- only :mod:`src.deflated_coarsen`
+    produces the harmonic constant ``eps_Q``, the block-distortion factor
+    ``mu_P^tau`` and hence the certified interval for the realized Euclidean RSA
+    error ``eps_Pi in [eps_Q, mu eps_Q]``.
+    """
+
+    cert = getattr(coarsening, "deflated_certificate", None)
+    if cert is None:
+        return None
+    ok = cert.get("sandwich_ok")
+    LOGGER.info(
+        f"{prefix}deflated certificate ({cert['rule']}): "
+        f"eps_Q={cert['epsilon_q_exact']:.4f} <= eps_Pi={cert['epsilon_pi']:.4f} "
+        f"<= mu*eps_Q={cert['sandwich_upper']:.4f}  "
+        f"(mu={cert['mu']:.3f}, tr H={cert['trace_h']:.4f}, "
+        f"mean leakage eta0={cert['leakage_mean']:.4f}, "
+        f"local-solve drift={cert['eps_q_drift']:.2e})"
+        + ("" if ok is None else f"  sandwich {'OK' if ok else 'VIOLATED'}")
+    )
+    LOGGER.info(
+        f"{prefix}  merge scores ||a||^2: median {cert['a_sq_median']:.3g}  "
+        f"p99 {cert['a_sq_p99']:.3g}  "
+        f"{cert['a_sq_zero_frac']:.1%} of merges are invisible to the target "
+        f"(score < 1e-12, so their order is decided by tie-breaking)"
+    )
+    return cert
+
+
 def _evaluate_transfer_day(
     det: CollectiveBankDetector,
     args: argparse.Namespace,
@@ -392,6 +423,9 @@ def _evaluate_transfer_day(
         "n_coarse": int(coarsening.n_coarse),
         "epsilon": float(getattr(coarsening, "epsilon", float("nan"))),
     }
+    cert = _log_deflated_certificate(coarsening)
+    if cert is not None:
+        record["coarsening"]["deflated_certificate"] = cert
     # per-gang missed-gang diagnostics from THIS day's coarsening (no re-coarsening)
     record["gang_rows"] = _gang_diagnostic_rows(
         det,
@@ -700,12 +734,21 @@ def main() -> None:
             "ward",
             "ward-tree",
             "dual-ward",
+            "deflated-dual-ward",
+            "deflated-minimax",
         ],
-        default="ward-tree",
+        default="deflated-minimax",
         help="'edges' scales best on the ~50k-node graph; 'ward-tree' builds the "
         "full Ward tree (heavier) and stops per --ward-stop; 'dual-ward' is Smooth "
         "Dual Ward (src.smooth_dual_ward), a Ward variant scored in the screened "
-        "dual metric -- see --dual-ward-* below.",
+        "dual metric -- see --dual-ward-* below.  'deflated-dual-ward' / "
+        "'deflated-minimax' are the screened-consistent agglomeration "
+        "(src.deflated_coarsen): merges are scored against the M_tau-orthogonal "
+        "(harmonic) block projector rather than the Euclidean block average, which "
+        "makes the merge calculus exactly rank-one PSD, the score monotone, and "
+        "eps_Q = sqrt(lambda_max(H)) the EXACT screened RSA of the harmonic "
+        "reconstruction; both build the full tree and stop per --ward-stop.  See "
+        "--deflated-* below.",
     )
     ap.add_argument(
         "--coarsening-laplacian",
@@ -767,6 +810,59 @@ def main() -> None:
     ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="f1")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
+    # --- deflated / screened-consistent agglomeration (src.deflated_coarsen) ---
+    ap.add_argument(
+        "--deflated-hops",
+        type=int,
+        default=2,
+        help="radius of the coarse ball the deflation solve (L_c + tau I) c = b is "
+        "truncated to.  Screening localizes the harmonic projector -- the "
+        "truncation error is O(q^r), q = (sqrt(kappa)-1)/(sqrt(kappa)+1) with "
+        "kappa <= (lambda_max + tau)/tau -- so r = 2 is already within ~1e-4 of the "
+        "global solve.",
+    )
+    ap.add_argument(
+        "--deflated-max-ball",
+        type=int,
+        default=32,
+        help="cap on the number of blocks in that ball (hub blocks would otherwise "
+        "make it global).  Measured: 32 matches 64 to ~1e-4 in eps_Q at ~2x the "
+        "speed.",
+    )
+    ap.add_argument("--deflated-max-rescore", type=int, default=8)
+    ap.add_argument(
+        "--deflated-fanout",
+        type=int,
+        default=32,
+        help="queue entries pushed per merge for the new block (its best-keyed "
+        "neighbours; 0 = all of them).  Elliptic++ day 25 has a degree-4,960 node, "
+        "and a block that absorbs it would otherwise push thousands of entries per "
+        "merge -- that queue growth, not the linear algebra, is what makes the "
+        "hierarchy superlinear (measured: >10 min vs 0.6 min for the full 17k tree).",
+    )
+    ap.add_argument(
+        "--deflated-max-cluster-size",
+        type=int,
+        default=0,
+        help="cap on supernode cardinality (0 = uncapped).",
+    )
+    ap.add_argument(
+        "--deflated-epsilon-key",
+        choices=["epsilon_pi", "epsilon_q"],
+        default="epsilon_pi",
+        help="which RSA constant --epsilon is spent in.  'epsilon_pi' is the "
+        "realized Euclidean constant every other coarsener reports (so budgets "
+        "stay comparable); 'epsilon_q' is the intrinsic harmonic constant the "
+        "algorithm optimizes, which is monotone along the hierarchy.",
+    )
+    ap.add_argument(
+        "--deflated-certify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="recompute eps_Q by brute force and the block-distortion factor "
+        "mu_P^tau at the chosen cut, giving the certified RSA sandwich interval "
+        "eps_Pi in [eps_Q, mu eps_Q] and the O(q^r) drift of the local solves.",
+    )
     # --- Smooth Dual Ward (coarsening_method="dual-ward"; see src.smooth_dual_ward) ---
     ap.add_argument(
         "--dual-ward-alpha",
@@ -932,6 +1028,13 @@ def main() -> None:
         dual_ward_tau=args.dual_ward_tau,
         dual_ward_max_size=args.dual_ward_max_size,
         dual_ward_embedding=args.dual_ward_embedding,
+        deflated_hops=args.deflated_hops,
+        deflated_max_ball=args.deflated_max_ball,
+        deflated_max_rescore=args.deflated_max_rescore,
+        deflated_fanout=args.deflated_fanout,
+        deflated_max_cluster_size=args.deflated_max_cluster_size,
+        deflated_epsilon_key=args.deflated_epsilon_key,
+        deflated_certify=args.deflated_certify,
         seed=args.seed,
     )
     det = CollectiveBankDetector(cfg)
@@ -1073,7 +1176,9 @@ def main() -> None:
         "report": det.evaluate(data, coarsening, splits),
         "captures": {n: det.capture(data, p) for n, p in splits.items() if p},
         "per_group_report": per_group_reports,
+        "deflated_certificate": getattr(coarsening, "deflated_certificate", None),
     }
+    _log_deflated_certificate(coarsening)
 
     fit = result["fit"]
     if cfg.collective_solver == "aeq":
@@ -1439,6 +1544,8 @@ def main() -> None:
             "n_original": co.n_original,
             "n_coarse": co.n_coarse,
             "epsilon": co.epsilon,
+            # only src.deflated_coarsen produces this (eps_Q, mu, RSA sandwich)
+            "deflated_certificate": result.get("deflated_certificate"),
         },
         "report": result["report"],
         # per-split capture C_S = Gamma_jj, measured in the run's own geometry

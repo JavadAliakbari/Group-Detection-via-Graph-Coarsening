@@ -155,6 +155,24 @@ class DetectorConfig:
 
     # --- coarsening + detection ----------------------------------------------
     coarsening_method: str = "ward-tree"
+    # --- screened-consistent (deflated) agglomeration ------------------------
+    # coarsening_method "deflated-dual-ward" / "deflated-minimax"
+    # (:mod:`src.deflated_coarsen`): merges are scored against the M_tau-ORTHOGONAL
+    # (harmonic) block projector Q_P^tau instead of the Euclidean block average, so
+    # the merge calculus is exactly rank-one PSD and the reported eps_Q is the exact
+    # screened RSA of the harmonic reconstruction.  The realized coarsening is still
+    # the Euclidean block averaging; the two are tied by the RSA sandwich
+    # eps_Q <= eps_Pi <= mu_P^tau eps_Q, all three of which are reported.
+    deflated_hops: int = 2  # r-hop coarse ball of the truncated deflation solve
+    deflated_max_ball: int = 32  # cap on that ball (hub blocks)
+    deflated_max_rescore: int = 8  # lazy-queue re-evaluations per merge
+    deflated_fanout: int = 32  # queue entries pushed per merge (0 = all)
+    deflated_max_cluster_size: int = 0  # 0 = uncapped
+    # which RSA constant the --epsilon budget is spent in: "epsilon_pi" is the
+    # realized Euclidean one every other method reports (comparable), "epsilon_q"
+    # is the intrinsic harmonic one the algorithm optimizes (monotone).
+    deflated_epsilon_key: str = "epsilon_pi"
+    deflated_certify: bool = True  # exact eps_Q + mu at the chosen cut
     # THE geometry switch: it selects the screened metric M_tau the filter bank is
     # trained in, the group indicator v_S the capture/confusability are fractions
     # of, the operator the Chebyshev bank propagates on, AND the metric the RSA
@@ -604,6 +622,33 @@ class CollectiveBankDetector:
                 "coarsening_method='dual-ward' is symmetric-only (it scores merges "
                 "in L_sym + tau I); use 'ward-tree', 'ward' or the greedy methods "
                 "with coarsening_laplacian='combinatorial'."
+            )
+        if c.coarsening_method in ("deflated-dual-ward", "deflated-minimax"):
+            from src.deflated_coarsen import deflated_tree_coarsen
+
+            return deflated_tree_coarsen(
+                data.adjacency,
+                basis,
+                train_patterns,
+                data.y,
+                tau=c.tau,
+                rule=(
+                    "dual-ward"
+                    if c.coarsening_method == "deflated-dual-ward"
+                    else "minimax"
+                ),
+                laplacian=c.coarsening_laplacian,
+                threshold=c.threshold,
+                stop=c.ward_stop,
+                epsilon_budget=(c.epsilon if c.epsilon is not None else math.inf),
+                epsilon_key=c.deflated_epsilon_key,
+                num_cuts=c.ward_num_cuts,
+                hops=c.deflated_hops,
+                max_ball=c.deflated_max_ball,
+                max_rescore=c.deflated_max_rescore,
+                fanout=c.deflated_fanout,
+                max_cluster_size=c.deflated_max_cluster_size,
+                certify=c.deflated_certify,
             )
         if c.coarsening_method == "ward-tree":
             return ward_tree_coarsen(
