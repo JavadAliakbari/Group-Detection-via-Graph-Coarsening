@@ -645,11 +645,36 @@ def main() -> None:
     )
     ap.add_argument("--softmin-temperature", type=float, default=0.2)
     ap.add_argument(
+        "--margin-alpha",
+        type=float,
+        default=0.25,
+        help="softmin temperature over the per-gang certified margins "
+        "(--capture-objective certified_margin).  0 = the hard worst-gang minimum, "
+        "which is what the certificate is stated on; >0 spreads the ascent over "
+        "every group, which matters because the binding group changes per step.",
+    )
+    ap.add_argument(
+        "--margin-softplus",
+        type=float,
+        default=0.5,
+        help="smooth the (.)_+ hinge of the boundary functional to "
+        "softplus(beta x)/beta.  The hard hinge is exactly zero whenever a group's "
+        "capture is below 1 - kappa^2 -- the normal state on a large graph, where "
+        "kappa ~ sqrt(tau w_min / vol S) is small -- and then the objective has NO "
+        "capture gradient at all.  A finite beta keeps that gradient while agreeing "
+        "with the hinge wherever the margin is comfortably positive.  The reported "
+        "certificate always uses the exact hinge.",
+    )
+    ap.add_argument(
         "--warm-start",
-        choices=["ones", "closed_form"],
+        choices=["ones", "closed_form", "resolvent"],
         default="closed_form",
         help="'closed_form' initializes theta at the best single filter consistent "
-        "with the per-gang Theorem 6.2 optima instead of the flat low-pass",
+        "with the per-gang Theorem 6.2 optima instead of the flat low-pass; "
+        "'resolvent' is the other end of the seed family M_tau^{-s} v_S -- the "
+        "least-squares fit theta = G_K^{-1} T_K^T v_S of the resolvent direction, "
+        "which by the master identity needs only the RAW indicators (no PPR solve, "
+        "no eigenproblem) and has chi = 0 exactly at s = 1",
     )
     ap.add_argument(
         "--softmin-anneal",
@@ -660,14 +685,20 @@ def main() -> None:
     )
     ap.add_argument(
         "--capture-objective",
-        choices=["lambda_min", "trace", "softmin_diag"],
-        default="lambda_min",
+        choices=["lambda_min", "trace", "softmin_diag", "certified_margin"],
+        default="certified_margin",
         help="what the bank ascends: 'lambda_min' (capture + cross-gang separation, "
         "carries the m>d capacity wall) | 'trace' (mean per-gang capture, no "
         "separation, no capacity wall) | 'softmin_diag' (worst gang's capture, no "
         "separation). trace/softmin_diag drop the cross-gang separation lambda_min "
         "buys, which the connectivity-constrained coarsener provides for free "
-        "(Prop 8.5); the needed neighbour separation is the confusability chi.",
+        "(Prop 8.5); the needed neighbour separation is the confusability chi. "
+        "'certified_margin' is the certified-margin objective (src.certified_margin): "
+        "softmin_j [ s_boundary(C_j) - chi_j ] with "
+        "s_boundary = (1/C)[(kappa - sqrt(1-C))_+]^2 and kappa the graph-only "
+        "adjacency floor.  It has NO --conf-weight beta and no collective Gram, and "
+        "its value is itself a recovery certificate: positive at every training "
+        "group implies raw-score Ward recovers all of them.",
     )
     ap.add_argument(
         "--label-weight",
@@ -995,6 +1026,8 @@ def main() -> None:
         warm_start=args.warm_start,
         softmin_anneal=args.softmin_anneal,
         capture_objective=args.capture_objective,
+        margin_alpha=args.margin_alpha,
+        margin_softplus=args.margin_softplus,
         collective_solver=args.collective_solver,
         pencil_beta=args.pencil_beta,
         aeq_alpha=args.aeq_alpha,
@@ -1233,6 +1266,46 @@ def main() -> None:
             f"max chi {fit['chi_subspace_max']:.4g}  margin {fit['margin']:.6g}  "
             f"tr(Gamma) {fit['trace_Gamma']:.4g}"
         )
+    elif cfg.capture_objective == "certified_margin":
+        LOGGER.info(
+            f"    certified margin (softmin over {len(gang_train)} train gangs): "
+            f"{fit['init_objective']:.4g} -> {fit['margin']:.4g}"
+        )
+        rch = np.asarray(fit.get("reachability") or [])
+        if rch.size:
+            LOGGER.info(
+                f"      reachability R_K (what the dictionary can express at all, "
+                f"pre-training): median {np.median(rch):.4g} "
+                f"[{rch.min():.3g}, {rch.max():.3g}]  =>  delta_min^2 = 1 - R_K"
+            )
+        kap = np.asarray(fit.get("margin_kappa") or [])
+        thr = np.asarray(fit.get("margin_capture_threshold") or [])
+        forced = np.asarray(fit.get("margin_chi_forced") or [])
+        if kap.size:
+            LOGGER.info(
+                f"      boundary floor kappa: median {np.median(kap):.4g} "
+                f"[{kap.min():.3g}, {kap.max():.3g}]  =>  a group needs capture "
+                f"C > 1 - kappa^2 = {np.median(thr):.6f} (median) before its "
+                f"boundary functional is even positive"
+            )
+            LOGGER.info(
+                f"      conflict bound (chi forced by full capture): median "
+                f"{np.median(forced):.4g}  |  nu^2 median "
+                f"{np.median(np.asarray(fit.get('margin_nu2') or [0])):.4g}"
+            )
+        LOGGER.info(
+            f"      CERTIFICATE (exact hinge, worst gang): {fit['certificate']:.4g}  "
+            f"-> {fit['n_certified']}/{len(gang_train)} training gangs certified"
+            f"; {fit['margin_feasible_capture']}/{len(gang_train)} reach the "
+            f"capture threshold at all"
+        )
+        if fit["n_certified"] == 0:
+            LOGGER.info(
+                "      note: a non-positive certificate does NOT mean the "
+                "coarsening fails -- the theorem is one-directional (positive => "
+                "recovery).  It means this instance's capture is far below the "
+                "level at which the boundary floor can dominate chi."
+            )
     else:
         LOGGER.info(
             f"    capture ({cfg.capture_objective}) / lambda_min(Gamma): "
@@ -1555,6 +1628,25 @@ def main() -> None:
             name: {k: v for k, v in cap.items() if k != "per_gang_capture"}
             for name, cap in (result.get("captures") or {}).items()
         },
+        # certified-margin objective: the certificate and the pre-training
+        # diagnostics that explain it (graph-only, so identical across arms)
+        "certified_margin": (
+            {
+                "objective_init": fit["init_objective"],
+                "objective_final": fit["margin"],
+                "certificate": fit.get("certificate"),
+                "n_certified": fit.get("n_certified"),
+                "n_feasible_capture": fit.get("margin_feasible_capture"),
+                "kappa": fit.get("margin_kappa"),
+                "capture_threshold": fit.get("margin_capture_threshold"),
+                "chi_forced": fit.get("margin_chi_forced"),
+                "nu2": fit.get("margin_nu2"),
+                "reachability": fit.get("reachability"),
+            }
+            if cfg.capture_objective == "certified_margin"
+            else None
+        ),
+        "reachability": fit.get("reachability") or None,
         "coarsener_comparison": result.get("coarsener_comparison") or None,
         # how the SHARED filter did on each training group's own graph (empty for a
         # single group); printed above, kept here so the export path can read it

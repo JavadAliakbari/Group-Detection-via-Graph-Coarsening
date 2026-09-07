@@ -95,6 +95,11 @@ from src.loukas_sgc_detection import (
     graph_operators,
     loukas_coarsen_pytorch,
 )
+from src.certified_margin import (
+    certified_margin_terms,
+    dictionary_reachability,
+    group_margin_stats,
+)
 from src.pattern_models import create_pattern
 from src.bank_visualize import save_rich_plots
 from src.propagation_encoders import GCN2Encoder, fit_encoder
@@ -742,8 +747,15 @@ def _capture_objective(
             if temperature > 0.0
             else torch.linalg.eigvalsh(gamma)[0]
         )
+    if kind == "certified_margin":  # pragma: no cover - routed before this call
+        raise RuntimeError(
+            "capture_objective='certified_margin' is not a function of Gamma alone "
+            "-- it pairs each gang's capture with that gang's confusability and "
+            "boundary floor, so it is evaluated by _margin_objective, not here."
+        )
     raise ValueError(
-        "capture_objective must be 'lambda_min', 'trace', or 'softmin_diag'"
+        "capture_objective must be 'lambda_min', 'trace', 'softmin_diag' or "
+        "'certified_margin'"
     )
 
 
@@ -1184,7 +1196,9 @@ def collective_confusability(
 
     Danskin over the ``max`` is automatic: the gradient flows through the single
     worst gang each step.  ``reduce="mean"`` uses the average instead (a smoother,
-    all-gang pressure if the hard max is too spiky).
+    all-gang pressure if the hard max is too spiky); ``reduce="none"`` returns the
+    whole per-gang vector, which the certified-margin objective needs because it
+    pairs each gang's ``chi`` with that gang's own boundary floor.
 
     The per-gang solves need only the shared Cholesky factor of ``G_Z + ridge I``
     and the (small, precomputed) gang tables -- **not** the full embedding.  Pass
@@ -1207,6 +1221,8 @@ def collective_confusability(
             g_z + ridge * torch.eye(d, dtype=g_z.dtype, device=g_z.device)
         )
     chis = torch.stack([_gang_confusability(theta, chol, t, eps) for t in tables])
+    if reduce == "none":
+        return chis  # per-gang vector, in the order of ``tables``
     return chis.mean() if reduce == "mean" else chis.max()
 
 
@@ -1331,6 +1347,11 @@ def _graph_bundle(
         .contiguous()
     )  # P: (K+1, K+1, d, d)
     rhs_kernel = (_pr.T @ m_vhat).reshape(degree + 1, d_feat, -1)  # Q: (K+1, d, m)
+    # Q_raw[k,a,j] = <phi_k x_a, v_j>: the RHS of the *resolvent* regression.  By
+    # the master identity T_K^T M_tau z_S^* = T_K^T v_S, fitting the resolvent
+    # direction is plain least squares in which the labels enter as raw
+    # indicators -- no PPR solve and no eigenproblem.
+    rhs_raw_kernel = (_pr.T @ V).reshape(degree + 1, d_feat, -1)
 
     rhs_test_kernel = None
     if test_patterns:
@@ -1358,6 +1379,14 @@ def _graph_bundle(
         else []
     )
 
+    # Graph-only inputs to the certified-margin objective: the adjacency floor
+    # kappa(S_j) and the diagnostics (vol, Phi, nu^2, the capture a group must
+    # exceed before its boundary functional is even positive).  None depend on
+    # Theta, so this is precompute, not per-epoch work.
+    margin_stats = (
+        group_margin_stats(geo, train_patterns, tau) if train_patterns else None
+    )
+
     return {
         "label": label,
         "a_hat": a_hat,
@@ -1368,8 +1397,10 @@ def _graph_bundle(
         "m_vhat": m_vhat,
         "gram_kernel": gram_kernel,
         "rhs_kernel": rhs_kernel,
+        "rhs_raw_kernel": rhs_raw_kernel,
         "rhs_test_kernel": rhs_test_kernel,
         "conf_tables": conf_tables,
+        "margin_stats": margin_stats,
         "propagated": propagated if keep_dense else None,
         "m_propagated": m_propagated if keep_dense else None,
         "m": len(train_patterns),
@@ -1401,6 +1432,8 @@ def fit_collective_bank(
     conf_halo_hops: int = 1,
     optimizer_kind: str = "projected",
     capture_objective: str = "lambda_min",
+    margin_alpha: float = 0.0,
+    margin_softplus: float = 0.0,
     label_weight: float = 0.0,
     label_y: "torch.Tensor | None" = None,
     label_idx: "torch.Tensor | None" = None,
@@ -1530,7 +1563,12 @@ def fit_collective_bank(
     eps = torch.finfo(dtype).eps
     d_feat = int(days[0][4].shape[1])
     n_col = d_feat * heads  # target width: one block of d columns per head
-    conf_active = conf_weight > 0.0 and any(len(spec[3]) > 0 for spec in days)
+    # the certified-margin objective consumes chi with coefficient one, so it
+    # needs the confusability tables whatever ``conf_weight`` says
+    margin_objective = capture_objective == "certified_margin"
+    conf_active = (conf_weight > 0.0 or margin_objective) and any(
+        len(spec[3]) > 0 for spec in days
+    )
 
     if len(days) > 1:
         LOGGER.info(
@@ -1637,7 +1675,7 @@ def fit_collective_bank(
         cls_w = (counts.sum() / counts.clamp_min(1.0)) / 2.0
 
     torch.manual_seed(fit_seed)
-    if warm_start == "closed_form" and any(b["m"] > 0 for b in bundles):
+    if warm_start in ("closed_form", "resolvent") and any(b["m"] > 0 for b in bundles):
         # per-gang Theorem 6.2 coefficients W_j = (T^T M T)^+ T^T M vhat_j, then
         # the best SINGLE filter per channel: the top left-singular vector of that
         # channel's {W_j[:, a]}_j (maximizes the summed squared alignment).  Each
@@ -1649,7 +1687,15 @@ def fit_collective_bank(
                 gram_full = torch.einsum("klab->kalb", b["gram_kernel"]).reshape(
                     (degree + 1) * d_feat, (degree + 1) * d_feat
                 )
-                rhs_full = b["rhs_kernel"].reshape((degree + 1) * d_feat, -1)
+                # "closed_form": T_K^T M_tau vhat_j  -> the indicator-regression
+                #   end of the seed family (the existing eq.-26 solve at beta=0).
+                # "resolvent":   T_K^T v_j            -> the resolvent end.  By the
+                #   master identity T_K^T M_tau z*_S = T_K^T v_S, fitting the
+                #   resolvent direction is plain least squares with the raw
+                #   indicator as the label -- no PPR solve, no eigenproblem.
+                rhs_full = b[
+                    "rhs_raw_kernel" if warm_start == "resolvent" else "rhs_kernel"
+                ].reshape((degree + 1) * d_feat, -1)
                 evals_g, evecs_g = torch.linalg.eigh(0.5 * (gram_full + gram_full.T))
                 keep_g = evals_g > evals_g.max() * 1e-10
                 coeff = evecs_g[:, keep_g] @ (
@@ -1780,6 +1826,7 @@ def fit_collective_bank(
     # track the best iterate by the *margin* lambda_min - beta*conf (eq. 40); when
     # beta=0 this reduces to the plain lambda_min criterion.
     best_lam, best_neg, best_conf = init_obj, init_neg, init_conf
+    best_certificate, best_n_certified, best_feasible = float("nan"), 0, 0
     best_crit = -float("inf")  # first epoch always sets the baseline (any objective)
     history: list[float] = []
     neg_history: list[float] = []
@@ -1803,6 +1850,12 @@ def fit_collective_bank(
     snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
     day_rng = np.random.default_rng(int(fit_seed))
     epoch_bar = tqdm(range(epochs), desc="fitting collective bank", leave=False)
+    # last-seen certified-margin terms of the binding graph (filled by
+    # _graph_objective when the margin objective is active), so the epoch loop can
+    # record the certificate without recomputing it
+    margin_report: dict = {}
+    certificate_history: list[float] = []
+    n_certified_history: list[int] = []
 
     def _capture_term(theta: torch.Tensor, temperature: float, bundle: dict):
         """``(pos_obj, gamma, chol)`` -- capture objective before the penalties."""
@@ -1816,14 +1869,51 @@ def fit_collective_bank(
             obj = obj - head_diversity * _diversity(theta)
         return obj, gamma_, chol_
 
+    def _margin_objective(theta: torch.Tensor, bundle: dict):
+        """``(obj, gamma, chol, conf_val, terms)`` for the certified-margin objective.
+
+        ``softmin_alpha_j [ s_boundary(C_j) - chi_j ]`` with
+        ``s_boundary = (1/C_j)[(kappa_j - sqrt(1-C_j))_+]^2``.  There is no
+        ``beta``, no collective Gram and no spectral soft-min: capture enters
+        per-gang through ``Gamma_jj``, confusability per-gang through its own
+        table, and the floors ``kappa_j`` are graph-only precompute.  The value
+        the optimizer ascends may be smoothed (``margin_softplus``); the
+        certificate reported alongside is always the exact hinge.
+        """
+
+        gamma_, chol_ = _gamma_and_chol(theta, bundle)
+        stats = bundle["margin_stats"]
+        chis = collective_confusability(
+            theta, None, bundle["a_hat"], tau, ridge, bundle["conf_tables"], eps,
+            reduce="none", chol=chol_,
+        )
+        terms = certified_margin_terms(
+            torch.diagonal(gamma_),
+            chis,
+            stats["kappa"].to(chis.dtype),
+            alpha=margin_alpha,
+            softplus_beta=margin_softplus,
+        )
+        obj = terms["objective"]
+        if head_diversity > 0.0:
+            obj = obj - head_diversity * _diversity(theta)
+        return obj, gamma_, chol_, float(chis.max().detach()), terms
+
     def _graph_objective(theta: torch.Tensor, temperature: float, bundle: dict):
         """``(obj, gamma, chol, conf_val)`` on ONE graph: capture minus eq. 40's chi.
 
         The eq. 40 margin subtracts the worst-gang confusability penalty from the
         capture floor, so the same step lifts lambda_min AND shrinks chi.  The
         confusability reuses the Gram's Cholesky factor -- also N-independent.
+
+        ``capture_objective="certified_margin"`` replaces the whole expression by
+        :func:`_margin_objective` (see :mod:`src.certified_margin`).
         """
 
+        if margin_objective and bundle["conf_tables"] and bundle["margin_stats"]:
+            obj, gamma_, chol_, conf_v, terms = _margin_objective(theta, bundle)
+            margin_report.update(terms)
+            return obj, gamma_, chol_, conf_v
         obj, gamma_, chol_ = _capture_term(theta, temperature, bundle)
         if not (conf_active and bundle["conf_tables"]):
             return obj, gamma_, chol_, 0.0
@@ -1863,6 +1953,35 @@ def fit_collective_bank(
             k = int(np.argmin([float(torch.linalg.eigvalsh(p[1])[0]) for p in per]))
             obj = torch.stack(objs).mean()
         return obj, per[k][1], per[k][2], bundles[k], per[k][3]
+
+    # Feature-side diagnostic, computable BEFORE training: how much of each
+    # group's resolvent direction the propagated features can express at all.
+    # delta_min(S)^2 = 1 - R_K(S) is a floor on the proximity ANY target inside
+    # the dictionary can reach, so R_K near 0 means no amount of training helps.
+    reachability: list = []
+    if first["m"] > 0:
+        with torch.no_grad():
+            g_full = torch.einsum("klab->kalb", first["gram_kernel"]).reshape(
+                (degree + 1) * d_feat, (degree + 1) * d_feat
+            )
+            reachability = [
+                float(v)
+                for v in dictionary_reachability(
+                    first["geometry"],
+                    first["patterns"],
+                    g_full,
+                    first["rhs_raw_kernel"].reshape((degree + 1) * d_feat, -1),
+                    tau,
+                )
+            ]
+            del g_full
+
+    if margin_objective and first["conf_tables"] and first["margin_stats"]:
+        # report the baseline of the objective actually being ascended; the
+        # lambda_min(Gamma) computed above is not what this run optimizes
+        with torch.no_grad():
+            init_obj = float(_margin_objective(_unit(raw), first)[0])
+        margin_report.clear()  # that was the initial value, not epoch 0's
 
     for _ep in epoch_bar:
         # geometric anneal of the soft-min temperature: warm early (gradient
@@ -1972,6 +2091,12 @@ def fit_collective_bank(
         margin_history.append(float(pos_obj.detach()))
         ce_history.append(ce_val)
         day_history.append(bundle["label"])
+        # the certified-margin objective reports its own guarantee: the EXACT
+        # (hard-hinge) worst per-gang margin, whose positivity implies raw-score
+        # Ward recovers every training group.
+        if margin_report:
+            certificate_history.append(float(margin_report["certificate"]))
+            n_certified_history.append(int(margin_report["n_certified"]))
         # held-out gangs on the stepped graph: no gradient, so this is a pure
         # validation reading of the same iterate
         lam_te = cap_te = float("nan")
@@ -2010,6 +2135,11 @@ def fit_collective_bank(
         if crit > best_crit:
             best_crit = crit
             best_lam = value
+            if margin_report:
+                # the certificate belongs to the RETAINED iterate, not the last
+                best_certificate = float(margin_report["certificate"])
+                best_n_certified = int(margin_report["n_certified"])
+                best_feasible = int(margin_report["feasible_capture"])
             best_neg = soft_neg_val
             best_conf = conf_val
             best_theta = (
@@ -2056,6 +2186,32 @@ def fit_collective_bank(
         "energy_history_test": energy_history_test,
         "neg_history": neg_history,
         "conf_history": conf_history,
+        "certificate_history": certificate_history,
+        "n_certified_history": n_certified_history,
+        "certificate": best_certificate,
+        "n_certified": best_n_certified,
+        "margin_feasible_capture": best_feasible,
+        "margin_kappa": (
+            [float(v) for v in bundles[0]["margin_stats"]["kappa"]]
+            if bundles and bundles[0].get("margin_stats") is not None
+            else []
+        ),
+        "margin_capture_threshold": (
+            [float(v) for v in bundles[0]["margin_stats"]["capture_threshold"]]
+            if bundles and bundles[0].get("margin_stats") is not None
+            else []
+        ),
+        "margin_chi_forced": (
+            [float(v) for v in bundles[0]["margin_stats"]["chi_forced"]]
+            if bundles and bundles[0].get("margin_stats") is not None
+            else []
+        ),
+        "reachability": reachability,
+        "margin_nu2": (
+            [float(v) for v in bundles[0]["margin_stats"]["nu2"]]
+            if bundles and bundles[0].get("margin_stats") is not None
+            else []
+        ),
         "energy_history": energy_history,
         "margin_history": margin_history,
         "ce_history": ce_history,

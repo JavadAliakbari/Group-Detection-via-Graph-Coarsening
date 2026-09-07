@@ -372,14 +372,18 @@ def main() -> None:
     ap.add_argument("--pencil-beta", type=float, default=0.0)
     ap.add_argument("--softmin-temperature", type=float, default=0.02)
     ap.add_argument(
-        "--warm-start", choices=["ones", "closed_form"], default="closed_form"
+        "--warm-start",
+        choices=["ones", "closed_form", "resolvent"],
+        default="closed_form",
     )
     ap.add_argument("--softmin-anneal", type=float, default=5.0)
     ap.add_argument(
         "--capture-objective",
-        choices=["lambda_min", "trace", "softmin_diag"],
+        choices=["lambda_min", "trace", "softmin_diag", "certified_margin"],
         default="lambda_min",
     )
+    ap.add_argument("--margin-alpha", type=float, default=0.0)
+    ap.add_argument("--margin-softplus", type=float, default=0.0)
     ap.add_argument("--label-weight", type=float, default=0.0)
     ap.add_argument("--neg-per-pos", type=float, default=1.0)
     ap.add_argument("--conf-weight", type=float, default=50.0)
@@ -524,6 +528,8 @@ def main() -> None:
         warm_start=args.warm_start,
         softmin_anneal=args.softmin_anneal,
         capture_objective=args.capture_objective,
+        margin_alpha=args.margin_alpha,
+        margin_softplus=args.margin_softplus,
         collective_solver=args.collective_solver,
         pencil_beta=args.pencil_beta,
         trace_ratio_iters=args.trace_ratio_iters,
@@ -575,7 +581,25 @@ def main() -> None:
     det.fit(day_specs, label_y=label_y, label_idx=label_idx)
     fit = det.fit_info_
 
-    if cfg.collective_solver != "closed-form":
+    if cfg.capture_objective == "certified_margin":
+        import numpy as _np
+
+        kap = _np.asarray(fit.get("margin_kappa") or [])
+        rch = _np.asarray(fit.get("reachability") or [])
+        LOGGER.info(
+            f"    certified margin: {fit['init_objective']:.4g} -> "
+            f"{fit['margin']:.4g}   CERTIFICATE (exact hinge) "
+            f"{fit.get('certificate', float('nan')):.4g}  -> "
+            f"{fit.get('n_certified', 0)}/{fit['n_train_patterns']} gangs certified, "
+            f"{fit.get('margin_feasible_capture', 0)} above the capture threshold"
+        )
+        if kap.size:
+            LOGGER.info(
+                f"      kappa median {_np.median(kap):.4g} => capture needed "
+                f"{_np.median(1 - kap**2):.4g}   |   R_K median "
+                f"{(_np.median(rch) if rch.size else float('nan')):.4g}"
+            )
+    elif cfg.collective_solver != "closed-form":
         LOGGER.info(
             f"    capture ({cfg.capture_objective}) / lambda_min(Gamma): "
             f"{fit['init_objective']:.4g} -> {fit['objective']:.4g}"

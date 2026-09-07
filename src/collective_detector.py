@@ -67,6 +67,12 @@ class DetectorConfig:
     # "ones" = flat low-pass init; "closed_form" = best single filter consistent
     # with the per-gang Theorem 6.2 optima (per-channel top singular vector)
     warm_start: str = "ones"
+    # certified-margin objective (capture_objective="certified_margin", see
+    # src.certified_margin): softmin temperature over the per-gang margins, and
+    # the softplus smoothing of the (.)_+ hinge that keeps a capture gradient
+    # below the certificate's feasibility threshold C > 1 - kappa^2.
+    margin_alpha: float = 0.0
+    margin_softplus: float = 0.0
     # >1 starts the soft-min at softmin_temperature * softmin_anneal and anneals
     # geometrically down to it (warm early spreads gradient over the spectrum)
     softmin_anneal: float = 1.0
@@ -491,6 +497,8 @@ class CollectiveBankDetector:
             heads=c.heads,
             head_diversity=c.head_diversity,
             warm_start=c.warm_start,
+            margin_alpha=c.margin_alpha,
+            margin_softplus=c.margin_softplus,
             softmin_anneal=c.softmin_anneal,
             capture_objective=c.capture_objective,
             label_weight=c.label_weight,
