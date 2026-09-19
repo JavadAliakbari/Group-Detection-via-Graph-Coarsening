@@ -415,9 +415,27 @@ def _evaluate_transfer_day(
         return record
 
     basis = det.target_subspace(data, day_gangs)  # R = span(Z); labels unused
-    coarsening, _ = det.coarsen(data, basis, day_gangs)
+    coarsening, trajectory = det.coarsen(data, basis, day_gangs)
     report = det.evaluate(data, coarsening, {"all": day_gangs})
     record["report"] = report.get("all")
+    # ORACLE eps*: the cut of the SAME hierarchy with the best F1 on this day's
+    # gangs.  Not a transfer result -- the labels pick the level -- but it
+    # separates the quality of the learned hierarchy from the label-free stop,
+    # which is known to under-coarsen the deflated family.
+    record["report_star"] = None
+    if trajectory:
+        from types import SimpleNamespace
+
+        star = max(trajectory, key=lambda e: e["train_f1"])
+        n2s_star = torch.from_numpy(star["labels"]).to(data.y.device)
+        rep_star = det.evaluate(
+            data, SimpleNamespace(node_to_supernode=n2s_star), {"all": day_gangs}
+        )["all"]
+        record["report_star"] = {
+            **rep_star,
+            "n_coarse": int(star["n_coarse"]),
+            "epsilon": float(star["epsilon"]),
+        }
     record["coarsening"] = {
         "n_original": int(coarsening.n_original),
         "n_coarse": int(coarsening.n_coarse),
@@ -447,6 +465,14 @@ def _evaluate_transfer_day(
             f"f1={r['mean_f1']:.3f} detection={r['detection_rate']:.1%} "
             f"({r['detected']}/{r['total']})"
         )
+    rs = record.get("report_star")
+    if rs is not None:
+        LOGGER.info(
+            f"  eps* (oracle best-F1 cut, n_coarse={rs['n_coarse']:,}): "
+            f"recall={rs['mean_recall']:.3f} precision={rs['mean_precision']:.3f} "
+            f"f1={rs['mean_f1']:.3f} detection={rs['detection_rate']:.1%} "
+            f"({rs['detected']}/{rs['total']})"
+        )
     return record
 
 
@@ -457,8 +483,14 @@ def main() -> None:
 
     ap.add_argument(
         "--collective-solver",
-        choices=["gradient", "closed-form", "trace-ratio", "aeq"],
-        default="gradient",
+        choices=[
+            "gradient",
+            "closed-form",
+            "trace-ratio",
+            "aeq",
+            "channel-closed-form",
+        ],
+        default="channel-closed-form",
         help="'gradient' = ascend --capture-objective (soft-min lambda_min) on "
         "the filter bank; 'closed-form' = Theta_beta = (G + beta*W_all)^{-1} Bhat, "
         "one shared factorization + m linear solves.  At --pencil-beta 0 the "
@@ -643,6 +675,88 @@ def main() -> None:
         "optimum; larger suppresses confusability, cost bounded by the "
         "reported optimality gap lambda_min(N_0) - lambda_min(N_beta))",
     )
+    ap.add_argument(
+        "--level-beta",
+        type=float,
+        default=1.0,
+        help="capture_objective=level: weight of the smooth worst level-covariance "
+        "bound chibar against the smooth worst level capture (src.level_objective)",
+    )
+    ap.add_argument("--level-chi-temperature", type=float, default=0.05)
+    ap.add_argument(
+        "--edge-gamma",
+        type=float,
+        default=10.0,
+        help="capture_objective=edge: weight of the internal-edge level contrast "
+        "against the boundary one (collapses for gamma <= 1; plateau 3-100)",
+    )
+    ap.add_argument(
+        "--cf-share-filters",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="--collective-solver channel-closed-form: one set of H filters shared by "
+        "all input channels (one (K+1)x(K+1) pencil averaged over channels) instead "
+        "of one filter set per channel.  'channel-closed-form' itself = per-channel "
+        "generalized eigenproblems of the --capture-objective pencil (level -> trace "
+        "surrogate, edge -> exact), pooled over the training days; no epochs",
+    )
+    ap.add_argument(
+        "--cf-host-mode",
+        choices=["none", "neighbours", "random"],
+        default="none",
+        help="--collective-solver channel-closed-form: which nodes the squared "
+        "screened-response penalty -lambda_H C_H acts on.  'neighbours' = the "
+        "non-group endpoints of edges leaving a training group; 'random' = a uniform "
+        "sample of non-group nodes from the whole graph.  Both exclude the TRAINING "
+        "groups only, so nodes of held-out groups can fall in the host set",
+    )
+    ap.add_argument(
+        "--cf-host-weight",
+        type=float,
+        default=0.0,
+        help="lambda_H >= 0, the weight of the host term (0 = off, the exact "
+        "no-host baseline)",
+    )
+    ap.add_argument(
+        "--cf-host-count",
+        type=int,
+        default=0,
+        help="--cf-host-mode random: how many host nodes to draw per training day "
+        "(0 = as many as the 'neighbours' mask would give)",
+    )
+    ap.add_argument(
+        "--cf-param-scale",
+        choices=["absolute", "relative"],
+        default="absolute",
+        help="--collective-solver channel-closed-form: 'relative' reads --edge-gamma / "
+        "--level-beta and --cf-host-weight as fractions of each block's own scale -- "
+        "the penalty of lambda_max(N, P), the cliff above which no direction has a "
+        "positive objective (keep < 1), the host weight of lambda_max(A, S) / "
+        "lambda_max(C_H, S)",
+    )
+    ap.add_argument(
+        "--cf-solver-form",
+        choices=["difference", "ratio"],
+        default="difference",
+        help="--collective-solver channel-closed-form: 'difference' = top eigenvectors "
+        "of N - penalty P - host C_H; 'ratio' = maximize tr N / tr(P + host C_H) by "
+        "Dinkelbach iteration, so the penalty is solved for (--edge-gamma / "
+        "--level-beta are ignored)",
+    )
+    ap.add_argument(
+        "--ridge-relative",
+        type=float,
+        default=0.0,
+        help="scale-free ridge eps*mean(diag G) on the channel Gram, added to --ridge "
+        "(1e-4 removes the capture knife edge the level objectives otherwise sit on)",
+    )
+    ap.add_argument(
+        "--analyze-coarsening",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="after the JSON report, re-coarsen the training graph and draw the "
+        "per-gang / edge-cost / conductance figures",
+    )
     ap.add_argument("--softmin-temperature", type=float, default=0.2)
     ap.add_argument(
         "--margin-alpha",
@@ -685,8 +799,15 @@ def main() -> None:
     )
     ap.add_argument(
         "--capture-objective",
-        choices=["lambda_min", "trace", "softmin_diag", "certified_margin"],
-        default="certified_margin",
+        choices=[
+            "lambda_min",
+            "trace",
+            "softmin_diag",
+            "certified_margin",
+            "level",
+            "edge",
+        ],
+        default="edge",
         help="what the bank ascends: 'lambda_min' (capture + cross-gang separation, "
         "carries the m>d capacity wall) | 'trace' (mean per-gang capture, no "
         "separation, no capacity wall) | 'softmin_diag' (worst gang's capture, no "
@@ -737,7 +858,7 @@ def main() -> None:
     ap.add_argument(
         "--heads",
         type=int,
-        default=8,
+        default=16,
         help="number of filter heads H: the bank is Theta (H, K+1, d) and the "
         "target is the concatenated span of its heads (H*d columns).  H=1 is the "
         "single shared filter and reproduces the classic behaviour exactly; H>1 "
@@ -768,7 +889,7 @@ def main() -> None:
             "deflated-dual-ward",
             "deflated-minimax",
         ],
-        default="deflated-minimax",
+        default="deflated-dual-ward",
         help="'edges' scales best on the ~50k-node graph; 'ward-tree' builds the "
         "full Ward tree (heavier) and stops per --ward-stop; 'dual-ward' is Smooth "
         "Dual Ward (src.smooth_dual_ward), a Ward variant scored in the screened "
@@ -837,7 +958,6 @@ def main() -> None:
     ap.add_argument("--reduction", type=float, default=0.3)
     ap.add_argument("--epsilon", type=float, default=1.0)
     ap.add_argument("--max-levels", type=int, default=10)
-
     ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="f1")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
@@ -889,7 +1009,7 @@ def main() -> None:
     ap.add_argument(
         "--deflated-certify",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="recompute eps_Q by brute force and the block-distortion factor "
         "mu_P^tau at the chosen cut, giving the certified RSA sandwich interval "
         "eps_Pi in [eps_Q, mu eps_Q] and the O(q^r) drift of the local solves.",
@@ -928,7 +1048,7 @@ def main() -> None:
     ap.add_argument(
         "--compare-coarseners",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="in addition to --coarsening-method, also coarsen with plain 'ward' "
         "and 'dual-ward' (at --dual-ward-alpha) on the SAME learned target basis "
         "and report all three side by side",
@@ -1068,6 +1188,16 @@ def main() -> None:
         deflated_max_cluster_size=args.deflated_max_cluster_size,
         deflated_epsilon_key=args.deflated_epsilon_key,
         deflated_certify=args.deflated_certify,
+        level_beta=args.level_beta,
+        level_chi_temperature=args.level_chi_temperature,
+        edge_gamma=args.edge_gamma,
+        ridge_relative=args.ridge_relative,
+        cf_share_filters=args.cf_share_filters,
+        cf_host_mode=args.cf_host_mode,
+        cf_host_weight=args.cf_host_weight,
+        cf_host_count=args.cf_host_count,
+        cf_param_scale=args.cf_param_scale,
+        cf_solver_form=args.cf_solver_form,
         seed=args.seed,
     )
     det = CollectiveBankDetector(cfg)
@@ -1306,6 +1436,21 @@ def main() -> None:
                 "recovery).  It means this instance's capture is far below the "
                 "level at which the boundary floor can dominate chi."
             )
+    elif cfg.collective_solver == "channel-closed-form":
+        npos = fit["n_positive_per_channel"]
+        LOGGER.info(
+            f"    closed form ({'SHARED' if fit['share_filters'] else 'per-channel'} "
+            f"filters, {fit['pencil']} pencil, pooled over {fit['n_instances']} training "
+            f"days): pencils {fit['pencil_seconds']:.1f}s + solve {fit['solve_seconds']:.3f}s; "
+            f"positive directions per channel min {min(npos)} / mean {np.mean(npos):.1f} / "
+            f"max {max(npos)} (H={cfg.heads})"
+        )
+        for lbl, v in fit["per_day"].items():
+            LOGGER.info(
+                f"      {lbl}: J_level={v['J_level']:.4g}  cap_min={v['cap_min']:.4g}  "
+                f"chibar_max={v['chibar_max']:.4g}  lambda_min={v['lambda_min']:.4g}  "
+                f"mean C={v['mean_capture']:.4g}"
+            )
     else:
         LOGGER.info(
             f"    capture ({cfg.capture_objective}) / lambda_min(Gamma): "
@@ -1316,6 +1461,30 @@ def main() -> None:
                 f"    confusability chi: {fit['confusability_init']:.4g} -> "
                 f"{fit['confusability']:.4g}"
             )
+    # Convergence of the fit, and capture / chi read EXACTLY on the reported
+    # graph's training groups -- the same measurement for every objective.
+    from src.run_synthetic_modular import _convergence, _level_diagnostics
+
+    fit_diag = {**_convergence(fit), **_level_diagnostics(det, data, gang_train)}
+    if cfg.capture_objective in ("level", "edge"):
+        fit_diag["objective_init"] = (fit.get("level_objective_init") or {}).get(
+            "level_obj"
+        )
+        fit_diag["objective_best"] = (fit.get("level_objective_best") or {}).get(
+            "level_obj"
+        )
+    if cfg.collective_solver == "channel-closed-form":  # no iterations to converge
+        fit_diag.update(
+            converged=None, objective_init=None, objective_best=fit["objective"]
+        )
+    LOGGER.info(
+        f"    [{'closed form' if fit_diag.get('converged') is None else ('converged' if fit_diag.get('converged') else 'NOT CONVERGED')}: tail "
+        f"drift {fit_diag.get('tail_drift', float('nan')):.1%}]  level view of the "
+        f"training groups: C mean {fit_diag.get('diag_cap_mean', float('nan')):.4f} "
+        f"min {fit_diag.get('diag_cap_min', float('nan')):.4f} | exact chi mean "
+        f"{fit_diag.get('diag_chi_mean', float('nan')):.4f} max "
+        f"{fit_diag.get('diag_chi_max', float('nan')):.4f}"
+    )
     # loss / capture / confusability / per-gang capture over the fit (the
     # closed-form solver has no training trace, so this is a no-op there)
     fig = write_training_report(
@@ -1507,6 +1676,23 @@ def main() -> None:
                 f"{avg['mean_f1']:>7.3f} {avg['detection_rate']:>10.1%} "
                 f"{tot_det:>4}/{tot_all:<5}"
             )
+            stars = [rec["report_star"] for rec in scored if rec.get("report_star")]
+            if stars:
+                avg_s = {k: float(np.mean([x[k] for x in stars])) for k in keys}
+                s_det = int(sum(x["detected"] for x in stars))
+                s_tot = int(sum(x["total"] for x in stars))
+                transfer_summary["eps_star"] = {
+                    **avg_s,
+                    "detected": s_det,
+                    "total": s_tot,
+                    "n_coarse_mean": float(np.mean([x["n_coarse"] for x in stars])),
+                }
+                LOGGER.info(
+                    f"  {'eps*':<5} {'':>8} {'':>6} "
+                    f"{avg_s['mean_recall']:>8.3f} {avg_s['mean_precision']:>10.3f} "
+                    f"{avg_s['mean_f1']:>7.3f} {avg_s['detection_rate']:>10.1%} "
+                    f"{s_det:>4}/{s_tot:<5}   <- oracle best-F1 cut, same hierarchy"
+                )
 
         for rec in transfer_records:  # collect each day's sweep for the summary table
             if rec.get("pr_sweep"):
@@ -1647,6 +1833,7 @@ def main() -> None:
             else None
         ),
         "reachability": fit.get("reachability") or None,
+        "fit_diagnostics": fit_diag,
         "coarsener_comparison": result.get("coarsener_comparison") or None,
         # how the SHARED filter did on each training group's own graph (empty for a
         # single group); printed above, kept here so the export path can read it
@@ -1663,6 +1850,8 @@ def main() -> None:
     }
     out_json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
     LOGGER.info(f"\nJSON report: {out_json}")
+    if not args.analyze_coarsening:
+        return  # the figure pass re-coarsens the training graph; JSON is written
 
     basis = det.target_subspace(data, gang_train)
     coarsening, _ = det.coarsen(data, basis, gang_train)

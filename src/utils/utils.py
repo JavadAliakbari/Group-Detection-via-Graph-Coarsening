@@ -20,7 +20,7 @@ import scipy as sp
 from tqdm import tqdm
 from src.utils.logger import getLOGGER
 
-seed = 5
+seed = 6
 torch.manual_seed(seed)
 np.random.seed(seed)
 random.seed(seed)

@@ -1289,6 +1289,8 @@ def _graph_bundle(
     conf_delta: float,
     conf_halo_hops: int,
     keep_dense: bool,
+    level_rows: bool = False,
+    edge_rows: bool = False,
     geometry=None,
 ) -> dict:
     """All ``O(N)`` work for ONE graph, precomputed once.
@@ -1387,6 +1389,23 @@ def _graph_bundle(
         group_margin_stats(geo, train_patterns, tau) if train_patterns else None
     )
 
+    # The LEVEL objective (capture_objective="level") reads M_tau Z only on the
+    # training-group rows: slice them out of the screened stack now, while it is
+    # still in memory, so the objective stays N-independent (src.level_objective).
+    level_rows_ = None
+    if level_rows and train_patterns:
+        from src.level_objective import build_level_rows
+
+        level_rows_ = build_level_rows(geo, train_patterns, m_propagated, phi)
+
+    # the EDGE variant (capture_objective="edge") needs M_tau Z on the endpoints
+    # of every internal and boundary edge of the training groups
+    edge_rows_ = None
+    if edge_rows and train_patterns:
+        from src.level_objective import build_edge_rows
+
+        edge_rows_ = build_edge_rows(geo, adjacency, train_patterns, m_propagated)
+
     return {
         "label": label,
         "a_hat": a_hat,
@@ -1401,6 +1420,8 @@ def _graph_bundle(
         "rhs_test_kernel": rhs_test_kernel,
         "conf_tables": conf_tables,
         "margin_stats": margin_stats,
+        "level_rows": level_rows_,
+        "edge_rows": edge_rows_,
         "propagated": propagated if keep_dense else None,
         "m_propagated": m_propagated if keep_dense else None,
         "m": len(train_patterns),
@@ -1443,6 +1464,18 @@ def fit_collective_bank(
     head_diversity: float = 0.0,
     day_aggregate: str = "sample",
     geometries: "list | None" = None,
+    level_weight: float = 0.0,
+    level_boundary_weight: float = 1.0,
+    level_negative_weight: float = 0.0,
+    level_form: str = "margin",
+    level_temperature: float = 0.05,
+    level_budget: int = 4096,
+    level_neg_kind: str = "pairs",
+    level_neg_scope: str = "all",
+    level_beta: float = 1.0,
+    level_chi_temperature: float = 0.05,
+    ridge_relative: float = 0.0,
+    edge_gamma: float = 1.0,
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -1566,7 +1599,17 @@ def fit_collective_bank(
     # the certified-margin objective consumes chi with coefficient one, so it
     # needs the confusability tables whatever ``conf_weight`` says
     margin_objective = capture_objective == "certified_margin"
-    conf_active = (conf_weight > 0.0 or margin_objective) and any(
+    # The LEVEL objective is a separate objective -- capture AND confusability are
+    # both read off the level (src.level_objective) -- not lambda_min plus a
+    # penalty, so the exact-chi penalty is off whatever conf_weight says.
+    level_objective_on = capture_objective == "level"
+    # the EDGE variant scores level contrasts on adjacent pairs directly -- also a
+    # standalone objective, so the exact-chi penalty is off for it too
+    edge_objective_on = capture_objective == "edge"
+    conf_active = (
+        (conf_weight > 0.0 or margin_objective)
+        and not (level_objective_on or edge_objective_on)
+    ) and any(
         len(spec[3]) > 0 for spec in days
     )
 
@@ -1575,6 +1618,10 @@ def fit_collective_bank(
             f"  multi-graph fit: building moment kernels for {len(days)} graphs "
             f"(K={degree}, d={d_feat}, aggregate={day_aggregate}) ..."
         )
+    # The level term reads the FULL (N, q) embedding of whichever graph the epoch
+    # steps on, so every graph must retain its propagated stacks -- unlike the
+    # negatives / label head, which are first-graph only.
+    level_active = level_weight != 0.0
     bundles = []
     for i, spec in enumerate(days):
         label, a_hat_i, adjacency_i, patterns_i, X_i = spec[:5]
@@ -1599,9 +1646,28 @@ def fit_collective_bank(
                 geometry=(geometries[i] if geometries is not None else None),
                 # the dense stacks are only ever read on the first graph (initial
                 # objective) and by the single-graph negatives / label head
-                keep_dense=(i == 0),
+                keep_dense=(i == 0 or level_active),
+                level_rows=level_objective_on,
+                edge_rows=edge_objective_on,
             )
         )
+        if level_active:
+            from src.level_contrast import build_level_pairs
+
+            bundles[-1]["level_pairs"] = build_level_pairs(
+                adjacency_i,
+                patterns_i,
+                tau=tau,
+                budget=level_budget,
+                seed=int(fit_seed) + 17 * i,
+                neg_kind=level_neg_kind,
+                neg_scope=level_neg_scope,
+            )
+            LOGGER.info(
+                f"    graph {label}: level pairs "
+                f"{bundles[-1]['level_pairs']['counts']}  "
+                f"(neg_kind={level_neg_kind}, scope={level_neg_scope})"
+            )
         if len(days) > 1:
             LOGGER.info(
                 f"    graph {label}: N={bundles[-1]['n']:,}  "
@@ -1640,7 +1706,15 @@ def fit_collective_bank(
         ).reshape(n_col, n_col)
         g_z = 0.5 * (g_z + g_z.T)
         m = torch.einsum("hka,kaj->haj", th, bundle[rhs_key]).reshape(n_col, -1)
-        chol = torch.linalg.cholesky(g_z + bundle["ridge_eye"])
+        ridge_mat = bundle["ridge_eye"]
+        if ridge_relative > 0.0:
+            # Scale-free ridge eps * mean(diag G): keeps cond(G + ridge) <~ 1/eps,
+            # which caps how much capture the near-null directions of Z can claim
+            # through G^{-1}.  Without it the warm start sits on a knife edge of
+            # capture (cond(G) ~ 1e8: a 1e-4 perturbation of Theta drops it 0.75 ->
+            # 0.59), which no gradient method can hold.
+            ridge_mat = ridge_mat + (ridge_relative * torch.diagonal(g_z).mean()) * eye_n_col
+        chol = torch.linalg.cholesky(g_z + ridge_mat)
         gamma = m.T @ torch.cholesky_solve(m, chol)  # Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat
         return 0.5 * (gamma + gamma.T), chol
 
@@ -1780,8 +1854,9 @@ def fit_collective_bank(
         del Z0
     # the dense stacks exist only for the baseline above and the single-graph
     # features; with several graphs nothing reads them again, so drop the
-    # (N, (K+1)d) pair rather than carrying it through the whole fit.
-    if len(bundles) > 1:
+    # (N, (K+1)d) pair rather than carrying it through the whole fit -- unless the
+    # level term is on, which reads them every epoch on whichever graph is drawn.
+    if len(bundles) > 1 and not level_active:
         first["propagated"] = first["m_propagated"] = None
 
     use_lbfgs = optimizer_kind == "lbfgs"
@@ -1854,6 +1929,17 @@ def fit_collective_bank(
     # _graph_objective when the margin objective is active), so the epoch loop can
     # record the certificate without recomputing it
     margin_report: dict = {}
+    # last-seen level-contrast parts (mean s^0 on internal / boundary / negative
+    # pairs and their AUC), filled by _level_term
+    level_report: dict = {}
+    level_history: list[dict] = []
+    # the LEVEL objective's own parts (smooth worst capture, smooth worst chibar,
+    # their hard counterparts), filled by _level_objective_fn
+    levelobj_report: dict = {}
+    levelobj_value_history: list[float] = []
+    levelobj_cap_history: list[float] = []
+    levelobj_chi_history: list[float] = []
+    best_levelobj: dict = {}
     certificate_history: list[float] = []
     n_certified_history: list[int] = []
 
@@ -1899,6 +1985,62 @@ def fit_collective_bank(
             obj = obj - head_diversity * _diversity(theta)
         return obj, gamma_, chol_, float(chis.max().detach()), terms
 
+    def _level_objective_fn(theta: torch.Tensor, temperature: float, bundle: dict):
+        """``(J, gamma, chol, chibar_max)`` -- the LEVEL objective on ONE graph.
+
+        ``J = softmin_T(C_j) - level_beta * softmax(chibar_j)`` with both terms
+        read off the level ``ell = D_t^{-1/2} M_tau Z`` on the training groups.
+        ``G`` and its Cholesky factor come from the same N-independent kernel as
+        the Gamma path; ``M_tau Z`` is needed only on group rows.  ``gamma`` is
+        still returned so every diagnostic (lambda_min, per-gang capture) is
+        recorded identically for both objectives.
+        """
+
+        from src.level_objective import level_objective
+
+        gamma_, chol_ = _gamma_and_chol(theta, bundle)
+        rows = bundle["level_rows"]
+        mz_rows = _filtered_bank(rows["mrows"], theta)
+        obj, parts = level_objective(
+            mz_rows,
+            rows,
+            chol_,
+            tau,
+            beta=level_beta,
+            cap_temperature=(temperature if temperature > 0.0 else 1e-3),
+            chi_temperature=level_chi_temperature,
+        )
+        if head_diversity > 0.0:
+            obj = obj - head_diversity * _diversity(theta)
+        levelobj_report.clear()
+        levelobj_report.update(parts)
+        # no exact chi is computed under this objective: report NaN rather than
+        # let the chibar BOUND masquerade as the confusability the lambda_min arm
+        # reports (chibar has its own trace, levelobj_chi_history)
+        return obj, gamma_, chol_, float("nan")
+
+    def _edge_objective_fn(theta: torch.Tensor, temperature: float, bundle: dict):
+        """``(J_edge, gamma, chol, nan)`` -- the EDGE variant on ONE graph.
+
+        Boundary level jumps minus ``edge_gamma`` x internal ones, each
+        ``||ell_u - ell_v||^2_{G^-1}`` with the same (ridged) Gram factor the
+        Gamma path uses (src.level_objective.edge_objective).  ``temperature``
+        is unused: the variant has no soft-min.
+        """
+
+        from src.level_objective import edge_objective
+
+        gamma_, chol_ = _gamma_and_chol(theta, bundle)
+        rows = bundle["edge_rows"]
+        obj, parts = edge_objective(
+            _filtered_bank(rows["mrows"], theta), rows, chol_, gamma=edge_gamma
+        )
+        if head_diversity > 0.0:
+            obj = obj - head_diversity * _diversity(theta)
+        levelobj_report.clear()
+        levelobj_report.update(parts)
+        return obj, gamma_, chol_, float("nan")
+
     def _graph_objective(theta: torch.Tensor, temperature: float, bundle: dict):
         """``(obj, gamma, chol, conf_val)`` on ONE graph: capture minus eq. 40's chi.
 
@@ -1910,11 +2052,16 @@ def fit_collective_bank(
         :func:`_margin_objective` (see :mod:`src.certified_margin`).
         """
 
+        if level_objective_on:
+            return _level_objective_fn(theta, temperature, bundle)
+        if edge_objective_on:
+            return _edge_objective_fn(theta, temperature, bundle)
         if margin_objective and bundle["conf_tables"] and bundle["margin_stats"]:
             obj, gamma_, chol_, conf_v, terms = _margin_objective(theta, bundle)
             margin_report.update(terms)
-            return obj, gamma_, chol_, conf_v
+            return obj - _level_term(theta, bundle), gamma_, chol_, conf_v
         obj, gamma_, chol_ = _capture_term(theta, temperature, bundle)
+        obj = obj - _level_term(theta, bundle)
         if not (conf_active and bundle["conf_tables"]):
             return obj, gamma_, chol_, 0.0
         conf = collective_confusability(
@@ -1929,6 +2076,34 @@ def fit_collective_bank(
             chol=chol_,
         )
         return obj - conf_weight * conf, gamma_, chol_, float(conf.detach())
+
+    def _level_term(theta: torch.Tensor, bundle: dict):
+        """``level_weight * L_level`` for this graph (0 when the term is off).
+
+        ``obj`` is ASCENDED, so the loss is subtracted by the caller.  The level
+        is the coarsener's own coordinate: this is the only term in the fit that
+        speaks to the merge scores directly rather than through ``Gamma``.
+        """
+
+        if not level_active or bundle.get("level_pairs") is None:
+            return torch.zeros((), dtype=theta.dtype, device=theta.device)
+        from src.level_contrast import level_contrast_loss
+
+        Z_l = _filtered_bank(bundle["propagated"], theta)
+        mz_l = _filtered_bank(bundle["m_propagated"], theta)
+        loss, parts = level_contrast_loss(
+            Z_l,
+            mz_l,
+            bundle["level_pairs"],
+            ridge=ridge,
+            form=level_form,
+            boundary_weight=level_boundary_weight,
+            negative_weight=level_negative_weight,
+            temperature=level_temperature,
+        )
+        level_report.clear()
+        level_report.update(parts)
+        return level_weight * loss
 
     def _positive(theta: torch.Tensor, temperature: float, drawn: "dict | None"):
         """The epoch's ascended objective over the graph list.
@@ -1983,6 +2158,20 @@ def fit_collective_bank(
             init_obj = float(_margin_objective(_unit(raw), first)[0])
         margin_report.clear()  # that was the initial value, not epoch 0's
 
+    init_levelobj: dict = {}
+    _standalone = (
+        _level_objective_fn
+        if level_objective_on and first.get("level_rows") is not None
+        else _edge_objective_fn
+        if edge_objective_on and first.get("edge_rows") is not None
+        else None
+    )
+    if _standalone is not None:
+        with torch.no_grad():
+            _standalone(_unit(raw), softmin_temperature, first)
+        init_levelobj = dict(levelobj_report)
+        levelobj_report.clear()
+
     for _ep in epoch_bar:
         # geometric anneal of the soft-min temperature: warm early (gradient
         # spread over the whole low end of the spectrum) -> sharp late.
@@ -2017,6 +2206,12 @@ def fit_collective_bank(
 
         theta = theta_param if riemannian else _unit(raw)
         pos_obj, gamma, _, bundle, conf_val = _positive(theta, temp_ep, drawn)
+        # Snapshot the iterate the objective was evaluated at.  The optimizer steps
+        # below, and the retained filter must be THIS one: storing the post-step
+        # parameter instead returns a filter one full step away from the recorded
+        # best -- harmless at a converged end, but a whole Adam step off a sharp
+        # optimum (e.g. a warm start that is already the best iterate).
+        theta_eval = theta.detach().clone()
 
         # optional supervised head on the SAME embedding, trained jointly.  Only the
         # labelled rows of Z are needed, so this stays cheap (the propagated stack is
@@ -2097,6 +2292,18 @@ def fit_collective_bank(
         if margin_report:
             certificate_history.append(float(margin_report["certificate"]))
             n_certified_history.append(int(margin_report["n_certified"]))
+        if level_report:
+            level_history.append(dict(level_report))
+        if levelobj_report:
+            # the two component traces: (capture, chibar) for the level
+            # objective, (boundary, internal) for the edge variant
+            levelobj_value_history.append(levelobj_report["level_obj"])
+            levelobj_cap_history.append(
+                levelobj_report.get("cap_soft", levelobj_report.get("bnd_mean", float("nan")))
+            )
+            levelobj_chi_history.append(
+                levelobj_report.get("chibar_soft", levelobj_report.get("int_mean", float("nan")))
+            )
         # held-out gangs on the stepped graph: no gradient, so this is a pure
         # validation reading of the same iterate
         lam_te = cap_te = float("nan")
@@ -2114,6 +2321,11 @@ def fit_collective_bank(
             lambda_min=f"{value:.4g}", margin=f"{float(pos_obj.detach()):.4g}",
             **({"graph": str(bundle["label"])} if len(bundles) > 1 else {}),
             **({"lam_te": f"{lam_te:.4g}"} if lam_te == lam_te else {}),
+            **(
+                {"lvl_auc": f"{level_report.get('auc', float('nan')):.3f}"}
+                if level_report
+                else {}
+            ),
         )
         if snap_interval > 0 and (_ep % snap_interval == 0 or _ep == epochs - 1):
             snapshots.append(
@@ -2142,11 +2354,8 @@ def fit_collective_bank(
                 best_feasible = int(margin_report["feasible_capture"])
             best_neg = soft_neg_val
             best_conf = conf_val
-            best_theta = (
-                theta_param.detach().clone()
-                if riemannian
-                else _unit(raw).detach().clone()
-            )
+            best_levelobj = dict(levelobj_report)
+            best_theta = theta_eval
 
     # the objective on EVERY graph at the retained iterate: with one graph this is
     # just a breakdown of ``objective``, with several it shows the spread the
@@ -2212,6 +2421,21 @@ def fit_collective_bank(
             if bundles and bundles[0].get("margin_stats") is not None
             else []
         ),
+        "level_history": level_history,
+        "level_final": (dict(level_history[-1]) if level_history else None),
+        "level_initial": (dict(level_history[0]) if level_history else None),
+        "level_weight": level_weight,
+        "level_negative_weight": level_negative_weight,
+        "level_form": level_form,
+        "level_beta": level_beta,
+        "ridge_relative": ridge_relative,
+        "edge_gamma": edge_gamma,
+        "level_chi_temperature": level_chi_temperature,
+        "level_objective_init": init_levelobj,
+        "level_objective_best": best_levelobj,
+        "levelobj_value_history": levelobj_value_history,
+        "levelobj_cap_history": levelobj_cap_history,
+        "levelobj_chi_history": levelobj_chi_history,
         "energy_history": energy_history,
         "margin_history": margin_history,
         "ce_history": ce_history,

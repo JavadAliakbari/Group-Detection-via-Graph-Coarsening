@@ -1234,7 +1234,12 @@ def deflated_tree_coarsen(
     best = None
     cuts = res.labels_at_many(ks.tolist())
     for k in ks.tolist():
-        labels = cuts[int(k)]
+        # On a disconnected graph the agglomeration runs out of adjacent pairs
+        # before k blocks are reached, so labels_at_many has no entry for that k
+        # (its key is the coarsest reachable count, n - m).  Skip those levels.
+        labels = cuts.get(int(k))
+        if labels is None:
+            continue
         n_coarse = int(labels.max()) + 1
         lvl = by_level.get(n_coarse)
         if lvl is None:  # k below the number of connected components

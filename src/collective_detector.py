@@ -83,6 +83,62 @@ class DetectorConfig:
     # coarsener never merges non-adjacent gangs, so cross-gang separation is free
     # (Prop 8.5) and only neighbour separation (the confusability chi) is needed.
     capture_objective: str = "lambda_min"
+    # --- level-contrastive term (src.level_contrast) --------------------------
+    # Shapes the coarsener's OWN coordinate, the level ell = D_t^{-1/2} M_tau Z,
+    # instead of only Gamma: it pushes the raw-Ward score s^0 down on edges inside
+    # a training group, up on edges crossing its boundary, and (optionally) down on
+    # random node pairs so the host level stays flat -- the shape the idealized
+    # screened-dual target Z* = M_tau^-1 V* actually has.  level_weight = 0 is off
+    # and byte-identical to before.
+    level_weight: float = 0.0
+    level_boundary_weight: float = 1.0
+    level_negative_weight: float = 0.0  # THE knob under test
+    level_form: str = "margin"  # "margin" | "rank" (a direct AUC surrogate)
+    level_temperature: float = 0.05  # softplus scale of the "rank" form
+    level_budget: int = 4096  # sampled pairs per class per graph
+    level_neg_kind: str = "pairs"  # "pairs" (random nodes) | "edges" (host-host)
+    level_neg_scope: str = "all"  # "all" | "host"
+    # --- the LEVEL objective (capture_objective="level", src.level_objective) --
+    # A SEPARATE objective, not a penalty on lambda_min: with the level
+    # ell = D_t^{-1/2} M_tau Z it maximizes the smooth worst capture
+    # C_S = vol/(Phi+tau) ||lbar_S||^2_{G^-1} and subtracts level_beta times the
+    # smooth worst level-covariance bound chibar_S = lambda_max(G^-1/2 Sigma_S
+    # G^-1/2)/tau.  conf_weight is ignored under this objective.
+    level_beta: float = 1.0
+    level_chi_temperature: float = 0.05
+    # scale-free ridge on the channel Gram, eps * mean(diag G), added to ``ridge``;
+    # 0 keeps the historical absolute ridge only
+    ridge_relative: float = 0.0
+    # capture_objective="edge": boundary level jumps minus edge_gamma x internal
+    # ones, each ||ell_u - ell_v||^2_{G^-1} (src.level_objective.edge_objective)
+    edge_gamma: float = 1.0
+    # collective_solver="channel-closed-form" only:
+    #   cf_share_filters -- ONE set of H filters theta_h in R^{K+1} shared by every
+    #                       input channel (pencil averaged over channels); the
+    #                       target range is then invariant to X -> X O, O orthogonal
+    #   cf_feature_draws -- extra FRESH random-feature realizations per training
+    #                       graph pooled into the pencil (0 = the graph's own X only;
+    #                       only meaningful for random, label-free features)
+    cf_share_filters: bool = False
+    cf_feature_draws: int = 0
+    #   cf_host_mode     -- known-host set H penalized by the squared screened
+    #                       response term -lambda_H C_H added to the pencil:
+    #                       "none", "neighbours" (non-group endpoints of edges
+    #                       leaving a training group) or "random" (uniform sample
+    #                       of non-group nodes); cf_host_count sizes the random one
+    #                       (0 = match the neighbours set)
+    #   cf_host_weight   -- lambda_H >= 0 (0 disables the term)
+    cf_host_mode: str = "none"
+    cf_host_weight: float = 0.0
+    cf_host_count: int = 0
+    #   cf_param_scale   -- "absolute" (raw edge_gamma / level_beta / cf_host_weight)
+    #                       or "relative" (fractions of each block's own scale: the
+    #                       penalty of the no-positive-direction cliff, the host
+    #                       weight of lambda_max(A, S) / lambda_max(C_H, S))
+    #   cf_solver_form   -- "difference" (N - penalty P - host C_H) or "ratio"
+    #                       (Dinkelbach on tr N / tr(P + host C_H); penalty solved for)
+    cf_param_scale: str = "absolute"
+    cf_solver_form: str = "difference"
     # how the collective target is obtained:
     #   "gradient"    -- ascend capture_objective (soft-min lambda_min etc.) by
     #                    Adam/L-BFGS on the filter bank  (the classic path)
@@ -160,6 +216,8 @@ class DetectorConfig:
     indicator: str = "geometry"
 
     # --- coarsening + detection ----------------------------------------------
+    # "ward-tree" | "raw-ward" | "deflated-dual-ward" | "deflated-minimax" |
+    # "dual-ward" | the Loukas greedy family ("edges", "neighborhood", ...)
     coarsening_method: str = "ward-tree"
     # --- screened-consistent (deflated) agglomeration ------------------------
     # coarsening_method "deflated-dual-ward" / "deflated-minimax"
@@ -205,6 +263,12 @@ class DetectorConfig:
     dual_ward_tau: float = 0.1  # screening level of M_tau = L_sym + tau I
     dual_ward_max_size: int = 0  # super-node cardinality cap (0 = uncapped)
     dual_ward_embedding: str = "dual"  # "dual" (M_tau U_tau) | "primal" (U_tau)
+    # Rank-q raw Ward (coarsening_method="raw-ward"; see src.raw_ward).  Merges
+    # adjacent blocks by s^0_R(A,B) = m^2 ||ell_bar_A - ell_bar_B||^2_{G^-1} /
+    # ||g_{A,B}||^2_{M_tau} on the vector level ell = D_t^{-1/2} M_tau Z, with the
+    # volume-weighted mean-level update, and is cut fine->coarse by ward_stop
+    # exactly like "ward-tree".  Symmetric-only.
+    raw_ward_max_size: int = 0  # super-node cardinality cap (0 = uncapped)
 
     seed: int = 0
 
@@ -453,6 +517,59 @@ class CollectiveBankDetector:
             self.fit_info_ = base
             return self
 
+        if c.collective_solver == "channel-closed-form":
+            # per-channel generalized eigenproblems of the level-trace / edge
+            # pencil (src.closed_form_level): theta in one shot, no epochs
+            self._require_symmetric(c.collective_solver)
+            from src.closed_form_level import fit_channel_closed_form, true_objectives
+
+            self.theta_, info = fit_channel_closed_form(
+                [(lbl, g, d, pats) for (lbl, d, pats, _te), g in zip(specs, geometries)],
+                objective=c.capture_objective,
+                degree=c.degree,
+                heads=c.heads,
+                tau=c.tau,
+                basis=c.basis,
+                level_beta=c.level_beta,
+                edge_gamma=c.edge_gamma,
+                share_filters=c.cf_share_filters,
+                feature_draws=c.cf_feature_draws,
+                seed=c.seed,
+                host_mode=c.cf_host_mode,
+                host_weight=c.cf_host_weight,
+                host_count=c.cf_host_count,
+                param_scale=c.cf_param_scale,
+                solver_form=c.cf_solver_form,
+            )
+            # the solution scored by the TRUE objectives (softmin / lambda_max level,
+            # exact edge; relative ridge 1e-4) and the capture, per training graph
+            per_day = {}
+            for (lbl, d, pats, _te), g in zip(specs, geometries):
+                cap = self.capture(d, pats)
+                per_day[lbl] = {
+                    "lambda_min": cap["lambda_min_gamma"],
+                    "mean_capture": cap["mean_capture"],
+                    "n_train_gangs": len(pats),
+                    **true_objectives(g, d, pats, self.target_subspace(d, pats),
+                                      c.tau, c.level_beta, c.edge_gamma),
+                }
+            key = "J_level" if c.capture_objective == "level" else "J_edge"
+            vals = [v[key] for v in per_day.values()]
+            obj = min(vals) if c.day_aggregate == "min" else sum(vals) / len(vals)
+            info.update(
+                theta=self.theta_,
+                per_day=per_day,
+                train_days=[s[0] for s in specs],
+                init_objective=float("nan"),
+                objective=obj,
+                margin=obj,
+                confusability_init=float("nan"),
+                confusability=float("nan"),
+                geometry=geometries[0].describe(),
+            )
+            self.fit_info_ = info
+            return self
+
         if c.collective_solver == "trace-ratio":
             self._require_symmetric(c.collective_solver)
             from src.trace_ratio_bank import fit_trace_ratio_bank
@@ -506,6 +623,18 @@ class CollectiveBankDetector:
             label_idx=label_idx,
             day_aggregate=c.day_aggregate,
             geometries=geometries,
+            level_weight=c.level_weight,
+            level_boundary_weight=c.level_boundary_weight,
+            level_negative_weight=c.level_negative_weight,
+            level_form=c.level_form,
+            level_temperature=c.level_temperature,
+            level_budget=c.level_budget,
+            level_neg_kind=c.level_neg_kind,
+            level_neg_scope=c.level_neg_scope,
+            level_beta=c.level_beta,
+            level_chi_temperature=c.level_chi_temperature,
+            ridge_relative=c.ridge_relative,
+            edge_gamma=c.edge_gamma,
         )
         self.theta_ = self.fit_info_["theta"]
         self.fit_info_["geometry"] = geometries[0].describe()
@@ -657,6 +786,22 @@ class CollectiveBankDetector:
                 fanout=c.deflated_fanout,
                 max_cluster_size=c.deflated_max_cluster_size,
                 certify=c.deflated_certify,
+            )
+        if c.coarsening_method == "raw-ward":
+            from src.raw_ward import raw_ward_tree_coarsen
+
+            return raw_ward_tree_coarsen(
+                data.adjacency,
+                basis,
+                train_patterns,
+                data.y,
+                tau=c.tau,
+                laplacian=c.coarsening_laplacian,
+                threshold=c.threshold,
+                stop=c.ward_stop,
+                epsilon_budget=(c.epsilon if c.epsilon is not None else math.inf),
+                num_cuts=c.ward_num_cuts,
+                max_cluster_size=c.raw_ward_max_size,
             )
         if c.coarsening_method == "ward-tree":
             return ward_tree_coarsen(
