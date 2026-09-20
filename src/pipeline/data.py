@@ -398,7 +398,7 @@ def _motif_edges(
 ) -> "list[tuple[int, int]]":
     """Undirected edge list of one planted group (reused from the legacy planter)."""
 
-    from src.run_collective_bank_detection import _motif_edges as legacy
+    from filters import _motif_edges as legacy
 
     return legacy(nodes, kind, density=density, rng=rng)
 
@@ -552,11 +552,11 @@ class Data:
         day's set so a filter fit on one day applies to every other.
         """
 
-        from src.run_elliptic_gang_conductance import (
+        from elliptic_dataset import (
             build_graph,
             connected_components_sets,
         )
-        from src.run_elliptic_gang_detection import load_node_features
+        from src.snap_communities import load_node_features
 
         c = self.config
         columns: "list[str] | None" = None
@@ -643,7 +643,7 @@ class Data:
         graph, split into train and held-out communities.
         """
 
-        from src.run_graph_fraud_gang_detection import load_snap_community
+        from snap_communities import load_snap_community
 
         c = self.config
         adjacency, communities = load_snap_community(c.data_dir, c.snap_name)

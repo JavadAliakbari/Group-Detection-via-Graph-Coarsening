@@ -512,7 +512,7 @@ class Coarsening:
         method = c.method
         n = int(graph.num_nodes)
         if method == "ward_tree":
-            from src.ward_pr_sweep import ward_order
+            from ward_pr_sweep import ward_order
 
             children, distances, a0, metric = ward_order(
                 graph.adjacency, basis, c.tau, laplacian="symmetric"
@@ -521,7 +521,7 @@ class Coarsening:
             scores = np.asarray(distances, dtype=np.float64)
             context = {"a0": a0, "metric": metric}
         elif method == "raw_ward":
-            from src.raw_ward import raw_ward
+            from raw_ward import raw_ward
 
             result = raw_ward(
                 _to_scipy(graph.adjacency),

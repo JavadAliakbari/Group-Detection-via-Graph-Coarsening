@@ -321,17 +321,3 @@ def create_pattern(
     return klass(
         pattern_id=pattern_id, nodes=list(nodes), pattern_type=pattern_type, label=label
     )
-
-
-def make_patterns(sets, label, pattern_type, prefix):
-    """Wrap node-index arrays as Pattern objects with the given label."""
-
-    return [
-        create_pattern(
-            pattern_id=f"{prefix}{i}",
-            nodes=[int(v) for v in S],
-            pattern_type=pattern_type,
-            label=label,  # 'alert' (gang) or 'normal'; the encoders key on this
-        )
-        for i, S in enumerate(sets)
-    ]

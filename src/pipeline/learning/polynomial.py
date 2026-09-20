@@ -45,7 +45,7 @@ from src.pipeline.geometry import (
 )
 from src.pipeline.learning.base import GraphContext, Learning, LearningConfig
 from src.pipeline.objective import EdgeIndexSets
-from src.run_collective_bank_detection import _basis_stack
+from filters import _basis_stack
 from src.utils.utils import LOGGER
 
 __all__ = ["PolynomialFilterLearning", "PolynomialBank"]

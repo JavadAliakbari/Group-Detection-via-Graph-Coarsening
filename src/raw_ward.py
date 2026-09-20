@@ -72,7 +72,7 @@ from typing import Dict, List, Sequence
 import numpy as np
 import scipy.sparse as sp
 
-from src.smooth_dual_ward import (
+from smooth_dual_ward import (
     _sanitize_adjacency,
     m_orthonormal_basis,
     screened_operators,
@@ -199,7 +199,9 @@ def screened_operators_kappa(W, tau: float, geometry: str = "symmetric"):
     if geometry in _SYMMETRIC:
         return screened_operators(W, tau)
     if geometry not in _COMBINATORIAL:
-        raise ValueError(f"geometry must be symmetric or combinatorial, got {geometry!r}")
+        raise ValueError(
+            f"geometry must be symmetric or combinatorial, got {geometry!r}"
+        )
     A = _sanitize_adjacency(W)
     n = A.shape[0]
     deg = np.asarray(A.sum(axis=1)).ravel()
@@ -495,9 +497,7 @@ def raw_ward(
         s0 = va0 + vb0
         diff0 = level[rows] - level[cols]
         numer0 = (va0 * vb0 / s0) * np.einsum("ij,ij->i", diff0, diff0)
-        cut0 = (
-            vb0 * (ocut[rows] / va0) + va0 * (ocut[cols] / vb0) + 2.0 * vals
-        ) / s0
+        cut0 = (vb0 * (ocut[rows] / va0) + va0 * (ocut[cols] / vb0) + 2.0 * vals) / s0
         keys0 = np.maximum(numer0, 0.0) / (np.maximum(cut0, 0.0) + tau)
         if deflated:
             # one edge at a time: every candidate needs its own A_{P'}
@@ -703,185 +703,6 @@ def _current_labels(n: int, children: Sequence[tuple]) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# pipeline driver: build the tree once, cut it fine -> coarse
-# --------------------------------------------------------------------------- #
-def raw_ward_tree_coarsen(
-    adjacency,
-    basis,
-    train_patterns: list,
-    node_labels,
-    *,
-    tau: float,
-    laplacian: str = "symmetric",
-    threshold: float = 0.51,
-    stop: str = "epsilon",
-    epsilon_budget: float = float("inf"),
-    num_cuts: int = 200,
-    max_cluster_size: int = 0,
-) -> tuple:
-    """Drop-in replacement for :func:`...run_collective_bank_detection.ward_tree_coarsen`.
-
-    ``laplacian`` selects the geometry: ``"symmetric"`` scores merges in
-    ``M_tau = L_sym + tau I`` with volumes and conductance, ``"combinatorial"``
-    in ``M_tau = (D - W) + tau I`` with cardinalities -- no volumes anywhere.
-
-    Builds the whole raw-Ward hierarchy once over ``R = span(basis)``, then walks
-    block counts from the finest combination toward the root, recording at each
-    cut the exact RSA distortion ``epsilon`` (the pipeline's uniform-block-average
-    constant, so it is directly comparable with the Ward-tree number) and the mean
-    **training** F1.  Stop rules match ``ward_tree_coarsen``:
-
-    * ``stop="epsilon"`` -- coarsest cut still within ``epsilon_budget``;
-    * ``stop="f1"``      -- cut with the best mean training F1.
-
-    Each trajectory entry also carries ``epsilon_pi`` -- the *degree-weighted*
-    block-average RSA constant, which is the projector this coarsener's score is
-    actually stated in (``ell_bar`` is a volume-weighted mean).  The two differ;
-    both are reported so a budget spent in one is never silently read in the other.
-
-    Returns ``(LoukasCoarseningResult, trajectory)``.
-    """
-
-    import torch
-    from scipy.sparse import coo_matrix
-
-    from src.loukas_sgc_detection import (
-        LoukasCoarseningResult,
-        evaluate_loukas_patterns,
-        _exact_rsa_epsilon,
-        _l_orthonormalize,
-        _laplacian,
-        _normalized_laplacian,
-        _screened_metric,
-    )
-    from src.utils.utils import LOGGER
-
-    if laplacian in _SYMMETRIC:
-        geometry = "symmetric"
-    elif laplacian in _COMBINATORIAL:
-        geometry = "combinatorial"
-    else:
-        raise ValueError(f"unknown laplacian {laplacian!r}")
-
-    adjacency = adjacency.coalesce()
-    n = int(adjacency.shape[0])
-    idx = adjacency.indices().cpu().numpy()
-    val = adjacency.values().cpu().numpy().astype(np.float64)
-    W = coo_matrix((val, (idx[0], idx[1])), shape=(n, n)).tocsr()
-    Z = basis.detach().cpu().to(torch.float64).numpy()
-
-    res = raw_ward(
-        W,
-        Z,
-        float(tau),
-        geometry=geometry,
-        build_full_tree=True,
-        max_cluster_size=max_cluster_size,
-    )
-
-    # the pipeline's own epsilon (uniform block average, M_tau metric) so the
-    # number is on the same axis as every other coarsener's in this repo
-    base_fn = _laplacian if geometry == "combinatorial" else _normalized_laplacian
-    metric = _screened_metric(base_fn(adjacency), tau)
-    a0 = _l_orthonormalize(basis, metric)
-    _A, kappa, _L, M = screened_operators_kappa(W, float(tau), geometry)
-    U, _ = m_orthonormal_basis(Z, M)
-
-    ks = np.unique(np.round(np.geomspace(2, max(n - 1, 2), max(num_cuts, 2))).astype(int))
-    ks = ks[(ks >= 2) & (ks <= n - 1)][::-1]
-
-    trajectory: list = []
-    best = None
-    seen_levels: set = set()
-    for k in ks.tolist():
-        labels = res.labels_at(int(k))
-        n_coarse = int(labels.max()) + 1
-        # On a disconnected graph the agglomeration stops when no adjacent pair
-        # remains, so every k below the component count yields the SAME coarsest
-        # partition; evaluate it once.
-        if n_coarse in seen_levels:
-            continue
-        seen_levels.add(n_coarse)
-        n2s = torch.from_numpy(labels).to(node_labels.device)
-        eps = _exact_rsa_epsilon(a0, metric, n2s)
-        results, by_label = evaluate_loukas_patterns(
-            train_patterns, n2s, node_labels, threshold=threshold
-        )
-        f1 = float(np.mean([r.f1 for r in results])) if results else 0.0
-        alert = by_label.get("alert", {})
-        entry = {
-            "n_coarse": n_coarse,
-            "epsilon": eps,
-            # the coarsener's OWN (kappa-weighted) projector.  Under
-            # combinatorial (kappa = 1) it coincides with "epsilon" above.
-            "epsilon_pi": float(exact_rsa_epsilon_kappa(U, M, kappa, labels)),
-            "train_f1": f1,
-            "recall": float(alert.get("mean_recall", 0.0) or 0.0),
-            "precision": float(alert.get("mean_precision", 0.0) or 0.0),
-            "labels": labels,
-        }
-        trajectory.append(entry)
-        if stop == "epsilon":
-            if eps <= epsilon_budget:
-                best = entry  # last (coarsest) feasible cut so far
-            else:
-                break
-        else:  # f1
-            if best is None or f1 > best["train_f1"]:
-                best = entry
-
-    if best is None:
-        if trajectory:
-            LOGGER.warning(
-                f"  raw-ward: the FINEST cut (n_coarse={trajectory[0]['n_coarse']:,}) "
-                f"already has epsilon={trajectory[0]['epsilon']:.4g} > budget "
-                f"{epsilon_budget:g}; returning it near-uncoarsened.  Raise "
-                f"--epsilon or switch to --ward-stop f1."
-            )
-        best = trajectory[0] if trajectory else None
-    if best is None:
-        raise ValueError("raw-ward produced no valid cut")
-
-    labels = best["labels"]
-    result = LoukasCoarseningResult(
-        node_to_supernode=torch.from_numpy(labels).to(node_labels.device),
-        n_original=n,
-        n_coarse=best["n_coarse"],
-        epsilon=best["epsilon"],
-        epsilon_bound=float("nan"),  # no per-level product bound for a tree cut
-        sigmas=[],
-        sizes=[n, best["n_coarse"]],
-    )
-    result.raw_ward_certificate = {
-        "geometry": geometry,
-        "n_coarse": int(best["n_coarse"]),
-        "epsilon": float(best["epsilon"]),
-        "epsilon_pi": float(best["epsilon_pi"]),
-        "q_effective": int(res.n_effective_target_dims_),
-        "gram_cond": float(np.linalg.cond(res.gram_)),
-        "score_median": float(
-            np.median([r["score"] for r in res.merge_records_])
-            if res.merge_records_
-            else float("nan")
-        ),
-        "score_p99": float(
-            np.percentile([r["score"] for r in res.merge_records_], 99)
-            if res.merge_records_
-            else float("nan")
-        ),
-        # merges the target subspace is blind to: s^0 ~ 0 means the pair's
-        # contrast direction carries no visible energy, so its position in the
-        # merge order is decided by ties, not by the score.
-        "score_zero_frac": float(
-            np.mean([r["score"] < 1e-12 for r in res.merge_records_])
-            if res.merge_records_
-            else float("nan")
-        ),
-    }
-    return result, trajectory
-
-
-# --------------------------------------------------------------------------- #
 # validation
 # --------------------------------------------------------------------------- #
 def _random_connected_graph(rng, n: int):
@@ -961,7 +782,9 @@ def _check_geometry(W, Z, tau, geometry, verbose):
     assert worst_pre < 1e-9, worst_pre
     assert worst_hi < 1e-9 and worst_lo < 1e-9, (worst_hi, worst_lo)
     say(f"[1] prewhitening  ||.||_G^-1 == ||.||_2 on r : rel err {worst_pre:.2e}")
-    say(f"    s^0 in [0, 1]                             : slack {max(worst_hi, worst_lo):.2e}")
+    say(
+        f"    s^0 in [0, 1]                             : slack {max(worst_hi, worst_lo):.2e}"
+    )
 
     # --- 2. local denominator / numerator / cut vs brute force --------------
     labels_now = np.arange(n)
@@ -1029,7 +852,9 @@ def _check_geometry(W, Z, tau, geometry, verbose):
     eps_uniform = math.sqrt(max(float(np.linalg.eigvalsh(0.5 * (H + H.T))[-1]), 0.0))
     if geometry in _COMBINATORIAL:
         assert abs(eps_kappa - eps_uniform) < 1e-9, (eps_kappa, eps_uniform)
-        say(f"[5] kappa-weighted RSA == uniform RSA         : {eps_kappa:.6f} (must match)")
+        say(
+            f"[5] kappa-weighted RSA == uniform RSA         : {eps_kappa:.6f} (must match)"
+        )
     else:
         say(
             f"[5] RSA  degree-weighted {eps_kappa:.4f}  vs uniform "
@@ -1038,7 +863,6 @@ def _check_geometry(W, Z, tau, geometry, verbose):
     return res
 
 
-def run_validation_suite(seed: int = 0, verbose: bool = True) -> None:
     """Every identity of the paragraph, in BOTH geometries, to machine precision."""
 
     rng = np.random.default_rng(seed)
@@ -1051,7 +875,7 @@ def run_validation_suite(seed: int = 0, verbose: bool = True) -> None:
     _check_geometry(W, Z, tau, "combinatorial", verbose)
 
     # --- symmetric raw Ward IS smooth_dual_ward(alpha=0, dual) --------------
-    from src.smooth_dual_ward import smooth_dual_ward
+    from smooth_dual_ward import smooth_dual_ward
 
     sdw = smooth_dual_ward(W, Z, tau, alpha=0.0, build_full_tree=True)
     same = all(
@@ -1077,10 +901,3 @@ def run_validation_suite(seed: int = 0, verbose: bool = True) -> None:
     if verbose:
         print("[7] symmetric and combinatorial partitions differ  : ok")
         print("\nALL RAW-WARD CHECKS PASSED (both geometries)")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    import sys, os
-
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    run_validation_suite()

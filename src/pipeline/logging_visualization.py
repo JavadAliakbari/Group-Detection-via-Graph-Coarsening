@@ -839,7 +839,7 @@ class LoggingVisualization:
 
     # -- figures ------------------------------------------------------------ #
     def _plot_per_group(self, evaluation: GraphEvaluation, mode: str) -> None:
-        from src.analyze_elliptic_coarsening import plot_gang_pr
+        from analyze_elliptic_coarsening import plot_gang_pr
 
         plt = self._figure()
         if plt is None:
@@ -880,7 +880,7 @@ class LoggingVisualization:
     def _edge_frame(self, evaluation: GraphEvaluation, mode: str):
         """Edge costs on the centralized whitened level, plus their categories."""
 
-        from src.analyze_elliptic_coarsening import edge_costs
+        from analyze_elliptic_coarsening import edge_costs
 
         edges = _undirected_edges(evaluation.graph)
         cost = edge_costs(evaluation.level, edges)
@@ -890,7 +890,7 @@ class LoggingVisualization:
         return edges, cost, categories, per_group, groups
 
     def _plot_edge_diagnostics(self, evaluation: GraphEvaluation, mode: str) -> None:
-        from src.analyze_elliptic_coarsening import plot_edge_cost
+        from analyze_elliptic_coarsening import plot_edge_cost
 
         plt = self._figure()
         if plt is None:
@@ -934,7 +934,7 @@ class LoggingVisualization:
         )
 
     def _plot_halo(self, evaluation: GraphEvaluation, mode: str) -> None:
-        from src.analyze_elliptic_coarsening import plot_gang_graph
+        from analyze_elliptic_coarsening import plot_gang_graph
 
         budget = self.config.halo_groups_per_graph
         if budget <= 0:

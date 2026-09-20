@@ -493,3 +493,82 @@ def arnoldi_iteration(A, m: int, b=None, log=True):
     # h = h.to(dev)
     # Q = Q.to(dev)
     return h.float(), Q.float()
+
+
+def _degrees(adjacency: torch.Tensor) -> torch.Tensor:
+    degree = torch.zeros(
+        adjacency.shape[0], dtype=adjacency.dtype, device=adjacency.device
+    )
+    degree.scatter_add_(0, adjacency.indices()[0], adjacency.values())
+    return degree
+
+
+def normalized_adjacency(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_weight: torch.Tensor | None = None,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Return sparse symmetric ``A_hat = D^-1/2 (A + I) D^-1/2``.
+
+    The AMLGenTex loader may return a directed transaction graph.  Eq. (48)
+    assumes the symmetric normalized adjacency, so directed edges are mirrored.
+    Existing reciprocal edges retain their original total weight; one-way edges
+    receive the same weight in both directions.
+    """
+
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape [2, num_edges]")
+    if num_nodes <= 0:
+        raise ValueError("num_nodes must be positive")
+
+    device = edge_index.device
+    rows, cols = edge_index[0], edge_index[1]
+    non_self = rows != cols
+    rows, cols = rows[non_self], cols[non_self]
+    if edge_weight is None:
+        values = torch.ones(rows.numel(), dtype=dtype, device=device)
+    else:
+        values = edge_weight.to(device=device, dtype=dtype)[non_self]
+
+    # A + A.T, divided by two: reciprocal entries retain their weight while a
+    # one-way transaction becomes an undirected edge of half weight per side.
+    symmetric_indices = torch.cat(
+        [torch.stack((rows, cols)), torch.stack((cols, rows))], dim=1
+    )
+    symmetric_values = torch.cat((values, values)) * 0.5
+    adjacency = torch.sparse_coo_tensor(
+        symmetric_indices,
+        symmetric_values,
+        (num_nodes, num_nodes),
+        device=device,
+        dtype=dtype,
+    ).coalesce()
+
+    loop_nodes = torch.arange(num_nodes, device=device)
+    with_loops = torch.sparse_coo_tensor(
+        torch.cat((adjacency.indices(), torch.stack((loop_nodes, loop_nodes))), dim=1),
+        torch.cat(
+            (adjacency.values(), torch.ones(num_nodes, dtype=dtype, device=device))
+        ),
+        (num_nodes, num_nodes),
+        device=device,
+        dtype=dtype,
+    ).coalesce()
+
+    degree = torch.zeros(num_nodes, dtype=dtype, device=device)
+    degree.scatter_add_(0, with_loops.indices()[0], with_loops.values())
+    inv_sqrt_degree = degree.clamp_min(torch.finfo(dtype).eps).rsqrt()
+    indices = with_loops.indices()
+    normalized_values = (
+        with_loops.values() * inv_sqrt_degree[indices[0]] * inv_sqrt_degree[indices[1]]
+    )
+    return torch.sparse_coo_tensor(
+        indices,
+        normalized_values,
+        (num_nodes, num_nodes),
+        device=device,
+        dtype=dtype,
+    ).coalesce()
+

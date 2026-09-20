@@ -125,7 +125,7 @@ from typing import Dict, List
 import numpy as np
 import scipy.sparse as sp
 
-from src.smooth_dual_ward import (
+from smooth_dual_ward import (
     exact_rsa_epsilon,
     m_orthonormal_basis,
     screened_operators,
@@ -1177,7 +1177,7 @@ def deflated_tree_coarsen(
     import torch
     from scipy.sparse import coo_matrix
 
-    from src.loukas_sgc_detection import (
+    from loukas_sgc_detection import (
         LoukasCoarseningResult,
         evaluate_loukas_patterns,
     )

@@ -26,8 +26,6 @@ Run::
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -43,18 +41,7 @@ import networkx as nx
 import numpy as np
 import torch
 
-from src.pattern_models import make_patterns
-from src.collective_detector import CollectiveBankDetector, DetectorConfig, GraphData
-from src.loukas_sgc_detection import (
-    _degrees,
-    _l_orthonormalize,
-    _laplacian,
-    _normalized_laplacian,
-    _screened_metric,
-    evaluate_loukas_patterns,
-)
-from src.run_elliptic_gang_conductance import connected_components_sets
-
+from src.utils.utils import _degrees
 
 # --------------------------------------------------------------------------- #
 # metrics
@@ -398,159 +385,3 @@ def plot_nongang_pr(normal_results, out: Path):
         "normal_mean_precision": float(prec.mean()) if prec.size else None,
         "normal_false_collapse_rate": rate,
     }
-
-
-def analyze_coarsening(
-    data: GraphData,
-    basis,
-    gangs,
-    det: CollectiveBankDetector,
-    gang_train,
-    args,
-    cfg: DetectorConfig,
-    coarsening,
-    n2s,
-    normals,
-):
-    # the metric must be the one the target basis and the RSA budget are stated
-    # in, or every epsilon reported below belongs to a different geometry than
-    # the coarsening that produced it
-    base_laplacian = (
-        _laplacian
-        if cfg.coarsening_laplacian in ("combinatorial", "comb")
-        else _normalized_laplacian
-    )
-    metric = _screened_metric(base_laplacian(data.adjacency), cfg.tau)
-    A = _l_orthonormalize(basis, metric)
-    gang_of = torch.full((data.num_nodes,), -1, dtype=torch.long)
-    for gi, g in enumerate(gangs):
-        gang_of[torch.as_tensor(list(g.nodes), dtype=torch.long)] = gi
-
-    summary = {
-        "config": cfg.to_dict(),
-        "day_start": args.day_start,
-        "day_end": args.day_end,
-        "n_nodes": data.num_nodes,
-        "n_gangs": len(gangs),
-        "n_coarse": coarsening.n_coarse,
-        "epsilon": coarsening.epsilon,
-        # gradient fit reports "objective"; the closed-form collective solver
-        # reports the Theorem A/B triple instead (lambda_min of Gamma)
-        "lambda_min": det.fit_info_.get(
-            "objective", det.fit_info_.get("lambda_min_Gamma")
-        ),
-    }
-
-    # (1) per-gang PR
-    train_ids = {p.id for p in gang_train}
-    gang_res, _ = evaluate_loukas_patterns(gangs, n2s, data.y, threshold=cfg.threshold)
-    detected = [bool(r.detected) for r in gang_res]
-    plot_gang_pr(gang_res, gangs, train_ids, args.out / "1_gang_precision_recall.png")
-    big = sorted(range(len(gangs)), key=lambda i: gangs[i].num_nodes, reverse=True)[:15]
-    summary["gangs_large"] = [
-        {
-            "size": gangs[i].num_nodes,
-            "recall": gang_res[i].recall,
-            "precision": gang_res[i].precision,
-            "f1": gang_res[i].f1,
-            "detected": detected[i],
-            "train": gangs[i].id in train_ids,
-        }
-        for i in big
-    ]
-    print(f"  [1] per-gang PR  (detected {sum(detected)}/{len(gangs)})")
-
-    # (2) edge cost
-    cost = edge_costs(A, data.edge_index)
-    gu, gv = gang_of[data.edge_index[0]], gang_of[data.edge_index[1]]
-    categories = torch.full_like(gu, 1)
-    categories[(gu >= 0) & (gu == gv)] = 0
-    categories[(gu < 0) & (gv < 0)] = 2
-    pg_cost = per_gang_edge_cost(cost, data.edge_index, gang_of, len(gangs))
-    gang_sizes = [g.num_nodes for g in gangs]
-    med, below, nvalid = plot_edge_cost(
-        cost, categories, pg_cost, gang_sizes, detected, args.out / "2_edge_cost.png"
-    )
-    summary["edge_cost_median"] = med
-    summary["gangs_internal_cheaper_than_boundary"] = f"{below}/{nvalid}"
-    print(
-        f"  [2] edge cost: internal<boundary for {below}/{nvalid} gangs; "
-        f"per-gang median interior={med['per_gang_interior_median']:.2e} "
-        f"boundary={med['per_gang_boundary_median']:.2e}"
-    )
-    # draw moderate-size gangs with the STRONGEST interior-cheap / boundary-costly
-    # contrast (clearest visual), not the giant sprawling ones
-    cand = [
-        (i, pg_cost[i][1] / pg_cost[i][0])
-        for i in range(len(gangs))
-        if np.isfinite(pg_cost[i][0])
-        and np.isfinite(pg_cost[i][1])
-        and pg_cost[i][0] < pg_cost[i][1]
-        and 12 <= gangs[i].num_nodes <= 90
-    ]
-    clean = [
-        i
-        for i, _ in sorted(cand, key=lambda t: t[1], reverse=True)[
-            : args.num_gang_graphs if hasattr(args, "num_gang_graphs") else 2
-        ]
-    ]
-    for i in clean:
-        plot_gang_graph(
-            data.edge_index,
-            cost,
-            gangs[i].id,
-            gangs[i].nodes,
-            args.out / f"2c_gang_graph_{gangs[i].id}_n{gangs[i].num_nodes}.png",
-        )
-    print(f"  [2c] drew {len(clean)} clean gang graphs")
-
-    # (3) conductance
-    phi_super, vol, sizes = supernode_conductance(data.adjacency, n2s)
-    gsuper = [dominant_supernode(n2s, list(g.nodes)) for g in gangs]
-    gphi = gang_conductance(data.adjacency, gang_of, len(gangs)).tolist()
-    cond = plot_conductance(
-        phi_super, sizes, gsuper, gphi, detected, args.out / "3_conductance.png"
-    )
-    summary["conductance"] = cond
-    summary["gang_conductance_detected_vs_missed"] = {
-        "detected_median": (
-            float(np.median([gphi[i] for i in range(len(gangs)) if detected[i]]))
-            if any(detected)
-            else None
-        ),
-        "missed_median": (
-            float(np.median([gphi[i] for i in range(len(gangs)) if not detected[i]]))
-            if not all(detected)
-            else None
-        ),
-    }
-
-    # every median here is None when its group is empty -- a coarsening that
-    # detects nothing (or everything) is a legitimate outcome to report, not a
-    # crash, so format defensively.
-    def _fmt(value):
-        return "n/a" if value is None else f"{value:.3f}"
-
-    print(
-        f"  [3] conductance: gang supernodes Φ={_fmt(cond['gang_median_conductance'])} "
-        f"vs bg Φ={_fmt(cond['background_median_conductance'])}; "
-        f"detected gangs Φ="
-        f"{_fmt(summary['gang_conductance_detected_vs_missed']['detected_median'])}"
-    )
-
-    # (4) non-gang PR
-    normal_res, _ = evaluate_loukas_patterns(
-        normals, n2s, data.y, threshold=cfg.threshold
-    )
-    ng = plot_nongang_pr(normal_res, args.out / "4_nongang_precision_recall.png")
-    ng["n_normals"] = len(normals)
-    summary["nongang"] = ng
-    print(
-        f"  [4] non-gang PR: recall={ng['normal_mean_recall']:.3f} prec={ng['normal_mean_precision']:.3f} "
-        f"false-collapse={ng['normal_false_collapse_rate']:.1%}"
-    )
-
-    (args.out / "analysis.json").write_text(
-        json.dumps(summary, indent=2, default=str) + "\n"
-    )
-    print(f"\nFigures + analysis.json -> {args.out}")

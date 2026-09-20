@@ -63,7 +63,7 @@ def test_level_is_invariant_to_an_invertible_right_factor(graph, geometry):
 def test_capture_matches_the_legacy_collective_gram(graph, geometry):
     """``C_S`` off the level equals ``Gamma_jj`` of the legacy Gram path."""
 
-    from src.run_collective_bank_detection import _collective_gamma, _make_indicators
+    from filters import _collective_gamma, _make_indicators
 
     generator = torch.Generator().manual_seed(3)
     Z = torch.randn(graph.num_nodes, 5, dtype=torch.float64, generator=generator)

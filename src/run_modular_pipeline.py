@@ -256,7 +256,7 @@ def main() -> None:
     parser.add_argument(
         "--coarsening-method",
         choices=["ward_tree", "raw_ward", "deflated_ward"],
-        default=None,
+        default="ward_tree",
     )
     parser.add_argument(
         "--cut-rule",
