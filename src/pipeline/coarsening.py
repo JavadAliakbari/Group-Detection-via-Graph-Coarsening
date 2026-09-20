@@ -57,6 +57,21 @@ point is found by bisection on the **exact** axis value, never off the
 interpolated trajectory.  ``transfer_cut_rule`` may be any of them: a learned
 :class:`CutRule` carries all four coordinates of its level.
 
+Deflation solve (``deflated_ward`` only)
+----------------------------------------
+Scoring a candidate merge needs the eliminated direction, which needs a solve of
+``(L_c + tau I) c = b`` on the *coarse* graph.  ``deflated_solve`` is the mode
+used to **rank** candidates (paid many times per merge); ``deflated_commit_solve``
+is the mode used for the merge actually **committed** (paid once per merge, and
+it is what fixes ``H_P``, ``eps_Q`` and the stored merge score).  ``"local"``
+truncates the solve to a ``deflated_hops``-hop ball capped at
+``deflated_max_ball`` blocks -- exact to ``O(q^r)`` by the exponential decay of
+the screened resolvent -- while ``"exact"`` assembles the full coarse system,
+which is dense and refuses to run above ~4,000 blocks.  The hierarchy starts at
+``N`` singletons, so ``"exact"`` needs ``N <= 4000``.
+``deflated_commit_solve="exact"`` is what turns the cumulative-score bound below
+into an identity while ranking stays cheap.
+
 Conventions
 -----------
 ``reduction = 1 - n_coarse / n_original`` -- the fraction of nodes **removed**.
@@ -105,11 +120,20 @@ class CoarseningConfig:
     reduction: float = 0.7
     detection_threshold: float = 0.51
     exact_epsilon_budget: int = 200
+    #: levels at which eps_Q is evaluated exactly.  Each one is an O(q^3)
+    #: eigensolve plus a q-right-hand-side block CG -- nothing like the cheap
+    #: common-epsilon solve -- so this is deliberately small.  0 disables the
+    #: eps_Q axis and the cumulative-score certificate entirely.
+    epsilon_q_budget: int = 12
     max_cluster_size: int = 0
     deflated_hops: int = 2
     deflated_max_ball: int = 32
     deflated_max_rescore: int = 8
     deflated_fanout: int = 32
+    # "exact" assembles a dense coarse system and is capped at ~4,000 blocks,
+    # so it is only usable for N <= 4000
+    deflated_solve: str = "local"
+    deflated_commit_solve: str = "local"
     transfer_cut_rule: str = "epsilon"
     seed: int = 0
 
@@ -133,6 +157,13 @@ class CoarseningConfig:
             raise ValueError("epsilon_budget must be non-negative")
         if self.exact_epsilon_budget < 0:
             raise ValueError("exact_epsilon_budget must be non-negative")
+        if self.epsilon_q_budget < 0:
+            raise ValueError("epsilon_q_budget must be non-negative")
+        if self.cut_rule == "epsilon_q" and self.epsilon_q_budget == 0:
+            raise ValueError("cut_rule='epsilon_q' needs epsilon_q_budget > 0")
+        for name in ("deflated_solve", "deflated_commit_solve"):
+            if getattr(self, name) not in ("local", "exact"):
+                raise ValueError(f"{name} must be 'local' or 'exact'")
 
 
 @dataclass
@@ -245,6 +276,7 @@ class CoarseningResult:
     cut_rule: "CutRule | None"
     target_rank: int = 0
     deflated_certificate: "dict | None" = None
+    score_certificate: "dict | None" = None
     config: dict = field(default_factory=dict)
 
     # the stopping rule is the deployable answer, so it is what the bare
@@ -293,6 +325,11 @@ class CoarseningResult:
             "per_group": self.per_group,
             "cut_rule": None if self.cut_rule is None else self.cut_rule.to_dict(),
             "deflated_certificate": self.deflated_certificate,
+            "score_certificate": (
+                None
+                if self.score_certificate is None
+                else {k: v for k, v in self.score_certificate.items() if k != "rows"}
+            ),
         }
 
 
@@ -514,13 +551,19 @@ class Coarsening:
                 max_ball=c.deflated_max_ball,
                 max_rescore=c.deflated_max_rescore,
                 fanout=c.deflated_fanout,
+                solve=c.deflated_solve,
+                commit_solve=c.deflated_commit_solve,
                 max_cluster_size=c.max_cluster_size,
                 track_euclidean=False,
                 record_curve=False,
             )
             children = np.asarray(result.children_, dtype=np.int64).reshape(-1, 2)
+            # ``a_sq``, not ``score``: ``score`` is the key the merge was *selected*
+            # with and goes stale when commit_solve refines the direction, while
+            # ``a_sq`` is always ||Q_R^tau h_hat||^2 of the direction actually
+            # committed -- the quantity the cumulative-score bound is stated for.
             scores = np.array(
-                [float(r.get("score", float("nan"))) for r in result.merge_records_],
+                [float(r.get("a_sq", float("nan"))) for r in result.merge_records_],
                 dtype=np.float64,
             )
             context = {}
@@ -642,16 +685,17 @@ class Coarsening:
         exact[np.clip(sampled, 0, merges)] = True
         return interpolated, exact, a0, metric
 
-    def _epsilon_q_evaluator(self, graph, basis, hierarchy: Hierarchy):
-        """Exact ``eps_Q(t) = sqrt(lambda_max(H_P^tau))`` of the harmonic lift.
+    def _harmonic_evaluator(self, graph, basis, hierarchy: Hierarchy):
+        """Cached ``t -> (eps_Q, trace(H_P), q)`` from a single harmonic solve.
 
-        The common ``epsilon`` axis scores the realized *uniform* block average;
-        ``eps_Q`` scores the harmonic reconstruction, which is the constant the
-        deflated sandwich is stated in.  It is defined for any partition, so it is
-        available under every merge rule, not only ``deflated_ward``.
+        ``eps_Q = sqrt(lambda_max(H_P))`` and ``trace(H_P)`` both come out of the
+        same ``H_P``, so the eps_Q axis and the cumulative-score certificate share
+        one cache instead of assembling ``H_P`` twice per level.  Each evaluation
+        is an ``O(q^3)`` eigensolve plus a ``q``-right-hand-side block CG, which
+        is why the budget is small and the cache matters.
         """
 
-        from src.deflated_coarsen import harmonic_rsa_epsilon
+        from src.deflated_coarsen import exact_harmonic_H
         from src.smooth_dual_ward import m_orthonormal_basis, screened_operators
 
         _a, d_tilde, _l, M = screened_operators(
@@ -660,13 +704,17 @@ class Coarsening:
         U, _rank = m_orthonormal_basis(basis.detach().cpu().numpy(), M)
         cache: dict = {}
 
-        def evaluate(merges: int) -> float:
+        def evaluate(merges: int) -> tuple:
             merges = int(merges)
             if merges not in cache:
                 labels = _labels_after(hierarchy.children, hierarchy.n_leaves, merges)
-                cache[merges] = float(harmonic_rsa_epsilon(U, M, d_tilde, labels))
+                H = exact_harmonic_H(U, M, d_tilde, labels)
+                lam = float(np.linalg.eigvalsh(H)[-1])
+                cache[merges] = (math.sqrt(max(lam, 0.0)), float(np.trace(H)))
             return cache[merges]
 
+        evaluate.q = int(U.shape[1])
+        evaluate.cache = cache
         return evaluate
 
     def _score_sum_axis(self, hierarchy: Hierarchy):
@@ -706,6 +754,11 @@ class Coarsening:
                 "retained": n_coarse / n,
                 "merge_score": (
                     float(hierarchy.scores[merges - 1]) if merges else float("nan")
+                ),
+                "merge_type": (
+                    "completion"
+                    if merges > hierarchy.constrained_merges
+                    else "deflated" if hierarchy.method == "deflated_ward" else "ward"
                 ),
             }
             for name, values in columns.items():
@@ -752,6 +805,42 @@ class Coarsening:
                 f"{oracle.n_coarse:,} (epsilon {oracle.epsilon:.3f}).  The target "
                 "subspace is not the limitation here -- the operating point is."
             )
+
+    def _warn_about_the_score_bound(self, graph, certificate: dict) -> None:
+        """Say when ``score_sum`` is not the quantity the cumulative bound is about.
+
+        The bound ``eps_Q^2 <= S_n <= q eps_Q^2`` is an identity for the *exact*
+        eliminated directions; the truncated solve and the completion merges each
+        break one of its hypotheses, and the difference is small enough to be
+        mistaken for a numerical artefact if it is not named.
+        """
+
+        if certificate["completion_merges"]:
+            LOGGER.info(
+                f"  [{graph.graph_id}] score_sum telescopes to trace(H_P) only over "
+                f"the {certificate['constrained_merges']:,} deflated merges; the "
+                f"{certificate['completion_merges']} completion merge(s) beyond them "
+                "are scored by a mass-weighted Ward increment, so the cumulative "
+                "bound is not claimed there"
+            )
+        if not certificate["holds_on_deflated_prefix"]:
+            first = certificate["first_violation"]
+            LOGGER.warning(
+                f"[{graph.graph_id}] the cumulative-score bound fails first at "
+                f"n_coarse={first['n_coarse']:,}: S_n={first['score_sum_raw']:.6g} vs "
+                f"eps_Q^2={first['epsilon_q_squared']:.6g} (lower gap "
+                f"{first['lower_gap']:+.2e}).  deflated_solve="
+                f"{certificate.get('solve')!r} returns a different eliminated "
+                f"direction than the harmonic one, so S_n does not telescope to "
+                f"trace(H_P) -- they differ by up to "
+                f"{certificate['max_abs_score_error']:.2e} here.  Set "
+                "deflated_commit_solve='exact' to make the bound exact."
+            )
+
+    def _exact_epsilon_cut(self, a0, metric, hierarchy, budget: float) -> int:
+        return self._budgeted_cut(
+            lambda t: _exact_epsilon(a0, metric, hierarchy, t), hierarchy, budget
+        )
 
     def _budgeted_cut(self, evaluate, hierarchy: Hierarchy, budget: float) -> int:
         """Coarsest cut whose **exact** axis value is within ``budget``.
@@ -846,24 +935,27 @@ class Coarsening:
                         f"{leaked[:3]}"
                     )
 
-        # eps_Q is a full eigensolve per level, so its axis is only materialized
-        # when a rule -- here or on a later transfer -- actually reads it
-        wants_q = "epsilon_q" in (rule, c.transfer_cut_rule)
-        evaluate_q = (
-            self._epsilon_q_evaluator(graph, basis, hierarchy) if wants_q else None
+        # every eps_Q level is an O(q^3) eigensolve plus a q-RHS block CG, so the
+        # axis gets its own small budget and the certificate reuses its cache
+        wants_score = "score_sum" in (rule, c.transfer_cut_rule)
+        wants_q = c.epsilon_q_budget > 0 and (
+            "epsilon_q" in (rule, c.transfer_cut_rule)
+            or (wants_score and c.method == "deflated_ward")
+        )
+        harmonic = (
+            self._harmonic_evaluator(graph, basis, hierarchy) if wants_q else None
         )
         columns = {"epsilon": epsilon, "epsilon_is_exact": exact_flags}
         score_raw, score_norm = (
-            self._score_sum_axis(hierarchy)
-            if "score_sum" in (rule, c.transfer_cut_rule)
-            else (None, None)
+            self._score_sum_axis(hierarchy) if wants_score else (None, None)
         )
         if score_norm is not None:
             columns["score_sum"] = score_norm
             columns["score_sum_raw"] = score_raw
-        if evaluate_q is not None:
+        evaluate_q = None if harmonic is None else (lambda t: harmonic(t)[0])
+        if harmonic is not None:
             q_values, q_exact = _adaptive_axis(
-                evaluate_q, int(hierarchy.children.shape[0]), c.exact_epsilon_budget
+                evaluate_q, int(hierarchy.children.shape[0]), c.epsilon_q_budget
             )
             columns["epsilon_q"] = q_values
             columns["epsilon_q_is_exact"] = q_exact
@@ -986,6 +1078,22 @@ class Coarsening:
                 graph, basis, labels, c.tau, exact_epsilon
             )
 
+        score_certificate = None
+        if harmonic is not None and score_norm is not None:
+            # the eps_Q axis already paid for its sampled levels; the first merges
+            # are added explicitly because that is where the bound is tight (H_P
+            # is near rank one there) and so where a violation actually shows
+            visited = [t for t in harmonic.cache if t <= hierarchy.constrained_merges]
+            score_certificate = cumulative_score_certificate(
+                harmonic,
+                graph.graph_id,
+                hierarchy,
+                visited + [1, 2, 3, merges, oracle_merges],
+            )
+            score_certificate["solve"] = c.deflated_solve
+            score_certificate["commit_solve"] = c.deflated_commit_solve
+            self._warn_about_the_score_bound(graph, score_certificate)
+
         return CoarseningResult(
             hierarchy=hierarchy,
             trajectory=trajectory,
@@ -996,6 +1104,7 @@ class Coarsening:
             cut_rule=learned_rule,
             target_rank=int(a0.shape[1]),
             deflated_certificate=certificate,
+            score_certificate=score_certificate,
             config=asdict(c),
         )
 
@@ -1097,6 +1206,100 @@ def _adaptive_axis(evaluate, merges: int, budget: int, min_gap: float = 1e-3):
     exact = np.zeros(merges + 1, dtype=bool)
     exact[np.clip(sampled, 0, merges)] = True
     return np.interp(np.arange(merges + 1), sampled, values), exact
+
+
+def cumulative_score_certificate(
+    harmonic,
+    graph_id: str,
+    hierarchy: Hierarchy,
+    levels,
+    *,
+    tolerance: float = 1e-9,
+) -> dict:
+    r"""Check ``(eps_Q)^2 <= S_n <= q (eps_Q)^2`` at the given levels.
+
+    ``S_n = sum_{k>n} ||Q_R^tau h_hat_{A_k,B_k}||_{M_tau}^2`` is the **unnormalized**
+    cumulative score (``score_sum_raw``), and ``q`` is the effective rank of the
+    target.  The bound is the eigenvalue/trace sandwich of the PSD harmonic
+    matrix ``H_P``: ``S_n`` telescopes to ``trace(H_P)`` and
+    ``eps_Q^2 = lambda_max(H_P)``, so it is tight exactly where ``H_P`` is close
+    to rank one -- the first few merges -- and slack afterwards.
+
+    ``harmonic`` is the cached ``t -> (eps_Q, trace(H_P))`` evaluator, so levels
+    the eps_Q axis already visited cost nothing here.  Those values are exact by
+    construction; the interpolated axis is never used to decide the verdict.
+
+    Two things break the identity and are reported rather than hidden:
+
+    * **completion merges** are scored by a mass-weighted Ward increment, not by
+      an eliminated deflated direction, so ``S_n`` stops telescoping past
+      ``hierarchy.constrained_merges``.  Levels beyond it are marked and excluded
+      from the verdict.
+    * a **truncated deflation solve** (``deflated_solve='local'``) returns a
+      different unit eliminated direction than the harmonic one, so each
+      ``||a||^2`` is perturbed in either direction, ``S_n`` stops telescoping to
+      ``trace(H_P)``, and the lower bound can fail where it is tight.
+      ``deflated_commit_solve='exact'`` restores it.
+    """
+
+    q = int(harmonic.q)
+    n = int(hierarchy.n_leaves)
+    total = int(hierarchy.children.shape[0])
+    cumulative = np.concatenate([[0.0], np.cumsum(np.asarray(hierarchy.scores))])
+
+    rows, violations = [], []
+    for t in sorted({int(t) for t in levels}):
+        if not 1 <= t <= total:
+            continue
+        eps_q, trace_h = harmonic(t)
+        eps_sq = eps_q * eps_q
+        s_n = float(cumulative[t])
+        is_completion = t > hierarchy.constrained_merges
+        lower_gap = s_n - eps_sq
+        upper_gap = q * eps_sq - s_n
+        row = {
+            "graph": graph_id,
+            "merge_index": t,
+            "n_coarse": n - t,
+            "q": q,
+            "epsilon_q": eps_q,
+            "epsilon_q_squared": eps_sq,
+            "score_sum_raw": s_n,
+            "score_sum_normalized": (
+                s_n / cumulative[-1] if cumulative[-1] > 0 else float("nan")
+            ),
+            "trace_h_exact": trace_h,
+            "lower_gap": lower_gap,
+            "upper_gap": upper_gap,
+            "ratio": s_n / eps_sq if eps_sq > 0 else float("nan"),
+            "epsilon_q_is_exact": True,
+            "merge_type": "completion" if is_completion else "deflated",
+        }
+        rows.append(row)
+        if not is_completion and min(lower_gap, upper_gap) < -tolerance:
+            violations.append(row)
+
+    deflated_rows = [r for r in rows if r["merge_type"] == "deflated"]
+    return {
+        "q": q,
+        "tolerance": tolerance,
+        "constrained_merges": int(hierarchy.constrained_merges),
+        "completion_merges": int(hierarchy.completion_merges),
+        "levels_checked": len(rows),
+        "holds_on_deflated_prefix": not violations,
+        "worst_lower_gap": (
+            min((r["lower_gap"] for r in deflated_rows), default=float("nan"))
+        ),
+        "worst_upper_gap": (
+            min((r["upper_gap"] for r in deflated_rows), default=float("nan"))
+        ),
+        "max_abs_score_error": max(
+            (abs(r["trace_h_exact"] - r["score_sum_raw"]) for r in deflated_rows),
+            default=float("nan"),
+        ),
+        "first_violation": violations[0] if violations else None,
+        "rows": rows,
+    }
 
 
 def _deflated_certificate(graph, basis, labels, tau, epsilon_common) -> dict:

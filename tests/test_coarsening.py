@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 import torch
 
-from src.pipeline.coarsening import Coarsening, CoarseningConfig, CutRule
+from src.pipeline.coarsening import (
+    Coarsening,
+    CoarseningConfig,
+    CutRule,
+    _labels_after,
+)
 from src.pipeline.learning import LearningConfig, PolynomialFilterLearning
 from src.pipeline.objective import ObjectiveConfig
 
@@ -140,11 +145,11 @@ def test_epsilon_q_axis_is_monotone_along_nested_partitions(bundle, fitted):
     hierarchy, _ctx = coarsener.build_hierarchy(
         graph, result.representations[graph.graph_id]
     )
-    evaluate = coarsener._epsilon_q_evaluator(
+    evaluate = coarsener._harmonic_evaluator(
         graph, result.representations[graph.graph_id], hierarchy
     )
     levels = np.linspace(0, hierarchy.n_leaves - 2, 12).astype(int)
-    values = [evaluate(int(t)) for t in levels]
+    values = [evaluate(int(t))[0] for t in levels]
     assert all(b - a >= -1e-9 for a, b in zip(values, values[1:]))
 
 
@@ -205,6 +210,237 @@ def test_a_cut_rule_without_the_requested_coordinate_is_refused():
     assert rule.budget_for("epsilon") == pytest.approx(0.4)
     with pytest.raises(ValueError, match="carries no 'epsilon_q' coordinate"):
         rule.budget_for("epsilon_q")
+
+
+# --------------------------------------------------------------------------- #
+# the cumulative-score bound  eps_Q^2 <= S_n <= q eps_Q^2
+#
+# S_n telescopes to trace(H_P) and eps_Q^2 = lambda_max(H_P), so the bound is the
+# eigenvalue/trace sandwich of a PSD q x q matrix.  Tolerance 1e-9 absolute: the
+# per-merge scores are accumulated in float64 and H_P is assembled by block CG
+# with tol 1e-11, so a few hundred merges leave errors around 1e-13.
+# --------------------------------------------------------------------------- #
+SCORE_BOUND_TOLERANCE = 1e-9
+
+
+def _deflated_scores(graph, basis, tau, **kw):
+    """Hierarchy plus the exact harmonic machinery, for the bound checks."""
+
+    from src.deflated_coarsen import exact_harmonic_H, harmonic_rsa_epsilon
+    from src.pipeline.coarsening import _to_scipy
+    from src.smooth_dual_ward import m_orthonormal_basis, screened_operators
+
+    coarsener = Coarsening(_config(method="deflated_ward", tau=tau, **kw))
+    hierarchy, _ctx = coarsener.build_hierarchy(graph, basis)
+    _a, d_tilde, _l, M = screened_operators(_to_scipy(graph.adjacency), tau)
+    U, rank = m_orthonormal_basis(basis.detach().cpu().numpy(), M)
+    return hierarchy, U, M, d_tilde, rank, exact_harmonic_H, harmonic_rsa_epsilon
+
+
+def test_cumulative_score_bound_holds_for_exact_deflated_scores(bundle, fitted):
+    """eps_Q^2 <= S_n <= q eps_Q^2 at EVERY genuine deflated merge."""
+
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    basis = result.representations[graph.graph_id]
+    hierarchy, U, M, d_tilde, rank, exact_H, eps_q_of = _deflated_scores(
+        graph, basis, 0.5, deflated_commit_solve="exact", cut_rule="score_sum"
+    )
+    q = U.shape[1]
+    assert q == rank  # q is the effective rank, not the column count
+
+    cumulative = np.concatenate([[0.0], np.cumsum(hierarchy.scores)])
+    deflated = hierarchy.constrained_merges
+    assert deflated >= 10
+    for t in range(1, deflated + 1):
+        labels = _labels_after(hierarchy.children, hierarchy.n_leaves, t)
+        eps_sq = eps_q_of(U, M, d_tilde, labels) ** 2
+        s_n = float(cumulative[t])
+        # S_n telescopes to trace(H_P) exactly under the exact commit solve
+        assert s_n == pytest.approx(
+            float(np.trace(exact_H(U, M, d_tilde, labels))), abs=SCORE_BOUND_TOLERANCE
+        )
+        assert s_n >= eps_sq - SCORE_BOUND_TOLERANCE
+        assert s_n <= q * eps_sq + SCORE_BOUND_TOLERANCE
+        if eps_sq > 0:
+            assert 1.0 - 1e-6 <= s_n / eps_sq <= q + 1e-6
+
+
+def test_the_first_merge_is_where_the_lower_bound_is_tight(bundle, fitted):
+    """After one merge H_P is rank one, so S_n == eps_Q^2 exactly."""
+
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    hierarchy, U, M, d_tilde, _rank, _H, eps_q_of = _deflated_scores(
+        graph,
+        result.representations[graph.graph_id],
+        0.5,
+        deflated_commit_solve="exact",
+        cut_rule="score_sum",
+    )
+    labels = _labels_after(hierarchy.children, hierarchy.n_leaves, 1)
+    assert float(hierarchy.scores[0]) == pytest.approx(
+        eps_q_of(U, M, d_tilde, labels) ** 2, abs=SCORE_BOUND_TOLERANCE
+    )
+
+
+def test_the_hierarchy_stores_the_committed_direction_not_the_selection_key(
+    bundle, fitted
+):
+    """``score`` is the queue key and goes stale; ``a_sq`` is what was committed."""
+
+    from src.deflated_coarsen import deflated_coarsen
+    from src.pipeline.coarsening import _to_scipy
+
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    basis = result.representations[graph.graph_id]
+    raw = deflated_coarsen(
+        _to_scipy(graph.adjacency),
+        basis.detach().cpu().numpy(),
+        0.5,
+        rule="dual-ward",
+        n_clusters=None,
+        build_full_tree=True,
+        solve="local",
+        commit_solve="exact",
+        track_euclidean=False,
+        record_curve=False,
+    )
+    a_sq = np.array([r["a_sq"] for r in raw.merge_records_])
+    score = np.array([r["score"] for r in raw.merge_records_])
+    assert not np.allclose(a_sq, score)  # the two genuinely differ in this mode
+    assert np.allclose(np.cumsum(a_sq), [r["trace_h"] for r in raw.merge_records_])
+
+    hierarchy, *_ = _deflated_scores(
+        graph, basis, 0.5, deflated_commit_solve="exact", cut_rule="score_sum"
+    )
+    assert np.allclose(hierarchy.scores[: len(a_sq)], a_sq)
+
+
+def test_local_deflation_breaks_the_lower_bound_and_says_so(bundle, fitted):
+    """Diagnostic: the production truncated solve is not the harmonic direction.
+
+    This documents the limit of the proposition rather than enforcing it: the
+    bound is stated for the exact eliminated direction, and ``solve='local'``
+    returns a different unit vector, so ``S_n`` stops telescoping to
+    ``trace(H_P)`` -- in either direction -- and the lower bound can fail where
+    it is tight.
+    """
+
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    basis = result.representations[graph.graph_id]
+    hierarchy, U, M, d_tilde, _rank, exact_H, eps_q_of = _deflated_scores(
+        graph, basis, 0.5, deflated_commit_solve="local", cut_rule="score_sum"
+    )
+    labels = _labels_after(hierarchy.children, hierarchy.n_leaves, 1)
+    exact_first = float(np.trace(exact_H(U, M, d_tilde, labels)))
+    assert float(hierarchy.scores[0]) != pytest.approx(
+        exact_first, abs=SCORE_BOUND_TOLERANCE
+    )
+
+    out = Coarsening(
+        _config(
+            method="deflated_ward",
+            cut_rule="score_sum",
+            epsilon_budget=0.4,
+            deflated_commit_solve="local",
+        )
+    ).run(graph, basis, train_groups=graph.train_groups)
+    certificate = out.score_certificate
+    assert certificate is not None
+    assert certificate["solve"] == "local"
+    # the discrepancy is real and two-sided, which is exactly why the bound is
+    # not claimed in this mode
+    assert certificate["max_abs_score_error"] > SCORE_BOUND_TOLERANCE
+    if not certificate["holds_on_deflated_prefix"]:
+        first = certificate["first_violation"]
+        assert first["lower_gap"] < 0
+        assert abs(first["lower_gap"]) <= 1e-2  # small, and it is the known cause
+
+
+def test_the_exact_commit_solve_restores_the_bound(bundle, fitted):
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    out = Coarsening(
+        _config(
+            method="deflated_ward",
+            cut_rule="score_sum",
+            epsilon_budget=0.4,
+            deflated_commit_solve="exact",
+        )
+    ).run(
+        graph, result.representations[graph.graph_id], train_groups=graph.train_groups
+    )
+    certificate = out.score_certificate
+    assert certificate["holds_on_deflated_prefix"]
+    assert certificate["worst_lower_gap"] >= -SCORE_BOUND_TOLERANCE
+    assert certificate["worst_upper_gap"] >= -SCORE_BOUND_TOLERANCE
+    assert certificate["max_abs_score_error"] <= SCORE_BOUND_TOLERANCE
+    assert all(row["epsilon_q_is_exact"] for row in certificate["rows"])
+
+
+def test_completion_merges_are_marked_and_excluded_from_the_bound(bundle, fitted):
+    """Their score is a Ward increment, not an eliminated deflated direction."""
+
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    basis = result.representations[graph.graph_id]
+    out = Coarsening(
+        _config(
+            method="deflated_ward",
+            cut_rule="score_sum",
+            epsilon_budget=0.4,
+            deflated_commit_solve="exact",
+        )
+    ).run(graph, basis, train_groups=graph.train_groups)
+
+    types = {row["merge_type"] for row in out.trajectory}
+    assert types <= {"deflated", "completion", "ward"}
+    boundary = out.hierarchy.constrained_merges
+    for row in out.trajectory:
+        expected = "completion" if row["merges"] > boundary else "deflated"
+        assert row["merge_type"] == expected
+
+    certificate = out.score_certificate
+    assert certificate["constrained_merges"] == boundary
+    # the verdict is only ever claimed on the deflated prefix
+    assert all(
+        row["merge_index"] <= boundary
+        for row in certificate["rows"]
+        if row["merge_type"] == "deflated"
+    )
+    if out.hierarchy.completion_merges:
+        hierarchy = out.hierarchy
+        from src.deflated_coarsen import exact_harmonic_H
+        from src.pipeline.coarsening import _to_scipy
+        from src.smooth_dual_ward import m_orthonormal_basis, screened_operators
+
+        _a, d_tilde, _l, M = screened_operators(_to_scipy(graph.adjacency), 0.5)
+        U, _r = m_orthonormal_basis(basis.detach().cpu().numpy(), M)
+        t = min(boundary + 1, hierarchy.children.shape[0])
+        labels = _labels_after(hierarchy.children, hierarchy.n_leaves, t)
+        s_n = float(np.sum(hierarchy.scores[:t]))
+        trace = float(np.trace(exact_harmonic_H(U, M, d_tilde, labels)))
+        # the two definitions have parted company; this is why it is excluded
+        assert abs(s_n - trace) > SCORE_BOUND_TOLERANCE
+
+
+def test_the_bound_is_not_claimed_for_the_other_merge_rules(bundle, fitted):
+    """ward_tree / raw_ward scores are different quantities entirely."""
+
+    _learner, result = fitted
+    graph = bundle.train_graphs[0]
+    for method in ("ward_tree", "raw_ward"):
+        out = Coarsening(
+            _config(method=method, cut_rule="score_sum", epsilon_budget=0.4)
+        ).run(
+            graph,
+            result.representations[graph.graph_id],
+            train_groups=graph.train_groups,
+        )
+        assert out.score_certificate is None
 
 
 def test_reduction_cut_rule(bundle, fitted):

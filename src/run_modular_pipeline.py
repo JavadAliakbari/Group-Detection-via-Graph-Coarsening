@@ -70,6 +70,7 @@ def _coarsening(method: str = "deflated_ward") -> CoarseningConfig:
         reduction=0.8,
         exact_epsilon_budget=200,
         detection_threshold=0.51,
+        deflated_commit_solve="local",
         seed=0,
     )
 
@@ -97,9 +98,7 @@ EXAMPLES: dict = {
             seed=0,
         ),
         coarsening=_coarsening(),
-        logging=LoggingVisualizationConfig(
-            Path(f"results/pipeline/{now}/poly_gradient")
-        ),
+        logging=LoggingVisualizationConfig(Path(f"results2/poly_gradient/{now}/")),
     ),
     # polynomial filter bank, gradient training, ratio objective (Dinkelbach)
     "polynomial-gradient-ratio": PipelineConfig(
@@ -118,7 +117,7 @@ EXAMPLES: dict = {
             seed=0,
         ),
         coarsening=_coarsening(),
-        logging=LoggingVisualizationConfig(Path(f"results/pipeline/{now}/poly_ratio")),
+        logging=LoggingVisualizationConfig(Path(f"results2/poly_ratio/{now}/")),
     ),
     # polynomial filter bank, closed form, with the frozen-level label head.
     # The ratio form solves for the penalty, so it cannot be configured above the
@@ -145,10 +144,17 @@ EXAMPLES: dict = {
             label_head_learning_rate=0.05,
             seed=0,
         ),
-        coarsening=_coarsening(),
-        logging=LoggingVisualizationConfig(
-            Path(f"results/pipeline/{now}/poly_closed_form")
+        coarsening=CoarseningConfig(
+            method="ward_tree",
+            tau=TAU,
+            cut_rule="score_sum",
+            transfer_cut_rule="score_sum",
+            epsilon_budget=0.2,
+            reduction=0.8,
+            exact_epsilon_budget=200,
+            deflated_commit_solve="local",
         ),
+        logging=LoggingVisualizationConfig(Path(f"results2/poly_closed_form/{now}/")),
     ),
     # nonlinear GCN, gradient training, with the jointly trained label head
     "gcn": PipelineConfig(
@@ -171,7 +177,7 @@ EXAMPLES: dict = {
             seed=0,
         ),
         coarsening=_coarsening(),
-        logging=LoggingVisualizationConfig(Path(f"results/pipeline/{now}/gcn")),
+        logging=LoggingVisualizationConfig(Path(f"results2/gcn/{now}/")),
     ),
     # nonlinear GraphSAGE, gradient training, with the jointly trained label head.
     # GraphSAGE's self path (W_self h) is not a graph propagation, so under the
@@ -206,7 +212,7 @@ EXAMPLES: dict = {
             seed=0,
         ),
         coarsening=_coarsening(),
-        logging=LoggingVisualizationConfig(Path(f"results/pipeline/{now}/graphsage")),
+        logging=LoggingVisualizationConfig(Path(f"results2/graphsage/{now}/")),
     ),
     # real data: Elliptic++ with the closed-form bank and transfer days
     "elliptic-closed-form": PipelineConfig(
@@ -224,7 +230,7 @@ EXAMPLES: dict = {
             seed=1,
         ),
         coarsening=_coarsening("deflated_ward"),
-        logging=LoggingVisualizationConfig(Path(f"results2/pipeline/{now}/elliptic")),
+        logging=LoggingVisualizationConfig(Path(f"results2/elliptic/{now}/")),
     ),
 }
 
@@ -234,10 +240,10 @@ def main() -> None:
     parser.add_argument(
         "--example",
         choices=sorted(EXAMPLES),
-        default="elliptic-closed-form",
+        # default="elliptic-closed-form",
         # default="gcn",
         # default="polynomial-gradient-ratio",
-        # default="polynomial-closed-form",
+        default="polynomial-closed-form",
     )
     parser.add_argument(
         "--out",
@@ -250,7 +256,7 @@ def main() -> None:
     parser.add_argument(
         "--coarsening-method",
         choices=["ward_tree", "raw_ward", "deflated_ward"],
-        default="deflated_ward",
+        default=None,
     )
     parser.add_argument(
         "--cut-rule",

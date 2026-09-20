@@ -546,6 +546,7 @@ class LoggingVisualization:
                     "  the RSA sandwich does not hold at this cut; mu is estimated "
                     "by power iteration and converges from below"
                 )
+        self._log_score_certificate(result)
 
         self._write_csv(
             result.trajectory,
@@ -565,6 +566,46 @@ class LoggingVisualization:
                 self._plot_per_group(evaluation, mode)
                 self._plot_edge_diagnostics(evaluation, mode)
                 self._plot_halo(evaluation, mode)
+
+    def _log_score_certificate(self, result) -> None:
+        """The ``eps_Q^2 <= S_n <= q eps_Q^2`` audit, level by level."""
+
+        certificate = getattr(result, "score_certificate", None)
+        if not certificate:
+            return
+        verdict = "HOLDS" if certificate["holds_on_deflated_prefix"] else "VIOLATED"
+        LOGGER.info(
+            f"  cumulative-score bound eps_Q^2 <= S_n <= q*eps_Q^2 (q="
+            f"{certificate['q']:,}, S_n = score_sum_raw, exact eps_Q): {verdict} "
+            f"over the {certificate['constrained_merges']:,} deflated merges "
+            f"[solve={certificate.get('solve')!r}, "
+            f"commit_solve={certificate.get('commit_solve')!r}]"
+        )
+        header = (
+            f"    {'merge':>9} {'n_coarse':>9} {'eps_Q':>8} {'eps_Q^2':>10} "
+            f"{'S_n(raw)':>11} {'S_n(norm)':>10} {'lower_gap':>11} "
+            f"{'upper_gap':>11} {'ratio':>9}  type"
+        )
+        LOGGER.info(header)
+        LOGGER.info("    " + "-" * (len(header) - 4))
+        for row in certificate["rows"]:
+            LOGGER.info(
+                f"    {row['merge_index']:>9,} {row['n_coarse']:>9,} "
+                f"{row['epsilon_q']:>8.4f} {row['epsilon_q_squared']:>10.6f} "
+                f"{row['score_sum_raw']:>11.6f} {row['score_sum_normalized']:>10.4f} "
+                f"{row['lower_gap']:>+11.3e} {row['upper_gap']:>+11.3e} "
+                f"{row['ratio']:>9.3f}  {row['merge_type']}"
+            )
+        LOGGER.info(
+            f"    worst lower gap {certificate['worst_lower_gap']:+.3e}, worst upper "
+            f"gap {certificate['worst_upper_gap']:+.3e}, largest |S_n - trace(H_P)| "
+            f"{certificate['max_abs_score_error']:.3e} "
+            f"(tolerance {certificate['tolerance']:.1e}; every eps_Q here is exact, "
+            "never the interpolated axis)"
+        )
+        self._write_csv(
+            certificate["rows"], ("trajectories", "cumulative_score_bound.csv")
+        )
 
     def log_cut_rule(self, rule) -> None:
         if rule is None:
@@ -990,7 +1031,96 @@ class LoggingVisualization:
         axes[0][0].set_ylabel("metric")
         axes[0][-1].legend(fontsize=6, ncol=2)
 
-        pr = axes[1][0]
+        # bottom-left: everything against the transferable stopping coordinate
+        versus = axes[1][0]
+        if "score_sum" in frame:
+            x, x_label = frame["score_sum"], "normalized cumulative merge score"
+        else:
+            x, x_label = frame["reduction"], "reduction (fraction removed)"
+        for split in splits:
+            for metric, style in (
+                ("mean_recall", "-"),
+                ("mean_precision", "--"),
+                ("mean_f1", "-."),
+                ("detection_rate", ":"),
+            ):
+                key = f"{split}_{metric}"
+                if key in frame:
+                    versus.plot(
+                        x,
+                        frame[key],
+                        style,
+                        lw=1.0,
+                        label=f"{split} {metric.replace('mean_', '')}",
+                    )
+        versus.plot(x, frame["epsilon"], lw=1.8, color="k", label="common epsilon")
+        if "epsilon_q" in frame:
+            versus.plot(x, frame["epsilon_q"], lw=1.8, color="tab:green", label="eps_Q")
+        for cut, colour in ((stopping, "k"), (oracle, "tab:purple")):
+            key = "score_sum" if "score_sum" in frame else "reduction"
+            if key in cut.row:
+                versus.axvline(
+                    float(cut.row[key]),
+                    color=colour,
+                    ls="--",
+                    alpha=0.8,
+                    label=f"{cut.mode} cut",
+                )
+        versus.set_xlabel(x_label)
+        versus.set_ylabel("metric / epsilon")
+        versus.set_ylim(0, 1.02)
+        versus.grid(alpha=0.3)
+        versus.legend(fontsize=6, ncol=2)
+
+        eps = axes[1][1]
+        eps.plot(frame["n_coarse"], frame["epsilon"], lw=1.2, label="common epsilon")
+        exact = frame[frame["epsilon_is_exact"]]
+        eps.plot(
+            exact["n_coarse"],
+            exact["epsilon"],
+            "k|",
+            ms=6,
+            alpha=0.7,
+            label=f"exact samples ({len(exact)})",
+        )
+        if "epsilon_q" in frame:
+            eps.plot(
+                frame["n_coarse"],
+                frame["epsilon_q"],
+                lw=1.2,
+                color="tab:green",
+                label="eps_Q (harmonic)",
+            )
+        # sqrt(S_n / q) <= eps_Q, read off the UNNORMALIZED score.  The companion
+        # upper bound sqrt(S_n) is far too loose to share an axis with it.
+        certificate = result.score_certificate
+        if "score_sum_raw" in frame and "epsilon_q" in frame and certificate:
+            q = max(int(certificate["q"]), 1)
+            eps.plot(
+                frame["n_coarse"],
+                np.sqrt(frame["score_sum_raw"].to_numpy() / q),
+                lw=1.0,
+                ls="--",
+                color="tab:red",
+                label="sqrt(S_n / q)  lower bound on eps_Q",
+            )
+            if result.hierarchy.completion_merges:
+                eps.axvline(
+                    result.hierarchy.n_leaves - result.hierarchy.constrained_merges,
+                    color="grey",
+                    ls="-.",
+                    lw=1.0,
+                    label="first completion merge",
+                )
+        eps.set_xscale("log")
+        eps.invert_xaxis()
+        eps.set_xlabel("number of supernodes")
+        eps.set_ylabel("epsilon  (S_n = raw cumulative score)")
+        eps.set_ylim(0, None)
+        eps.grid(alpha=0.3)
+        eps.legend(fontsize=6)
+
+        pr = axes[1][2]
         order = np.argsort(frame["all_mean_recall"].to_numpy())
         pr.plot(
             frame["all_mean_recall"].to_numpy()[order],
@@ -1014,46 +1144,33 @@ class LoggingVisualization:
         pr.set_ylim(0, 1.02)
         pr.set_title(f"PR curve over the hierarchy -- PR-AUC={result.pr_auc:.3f}")
         pr.grid(alpha=0.3)
-        pr.legend(fontsize=7)
+        pr.legend(fontsize=7, loc="upper right")
 
-        eps = axes[1][1]
-        eps.plot(frame["n_coarse"], frame["epsilon"], lw=1.2, label="common epsilon")
-        exact = frame[frame["epsilon_is_exact"]]
-        eps.plot(
-            exact["n_coarse"],
-            exact["epsilon"],
-            "k|",
-            ms=6,
-            alpha=0.7,
-            label=f"exact samples ({len(exact)})",
-        )
-        eps.set_xscale("log")
-        eps.invert_xaxis()
-        eps.set_xlabel("number of supernodes")
-        eps.set_ylabel("epsilon")
-        eps.grid(alpha=0.3)
-        eps.legend(fontsize=7)
-
-        red = axes[1][2]
-        red.plot(frame["n_coarse"], frame["reduction"], lw=1.2, color="tab:brown")
-        red.set_xscale("log")
-        red.invert_xaxis()
-        red.set_xlabel("number of supernodes")
-        red.set_ylabel("reduction (fraction removed)")
-        red.grid(alpha=0.3)
-        certificate = result.deflated_certificate
-        if certificate:
-            red.text(
-                0.02,
-                0.02,
+        deflated = result.deflated_certificate
+        notes = []
+        if deflated:
+            notes.append(
                 f"deflated certificate @ stopping cut\n"
-                f"eps_Q={certificate['epsilon_q']:.4f}  "
-                f"eps_Pi={certificate['epsilon_pi']:.4f}\n"
-                f"mu={certificate['mu']:.3f}  "
-                f"mu*eps_Q={certificate['sandwich_upper']:.4f}\n"
-                f"sandwich {'OK' if certificate['sandwich_ok'] else 'VIOLATED'}",
-                transform=red.transAxes,
-                fontsize=7,
+                f"eps_Q={deflated['epsilon_q']:.4f}  "
+                f"eps_Pi={deflated['epsilon_pi']:.4f}\n"
+                f"mu={deflated['mu']:.3f}  "
+                f"mu*eps_Q={deflated['sandwich_upper']:.4f}\n"
+                f"sandwich {'OK' if deflated['sandwich_ok'] else 'VIOLATED'}"
+            )
+        if certificate:
+            notes.append(
+                f"eps_Q^2 <= S_n <= q eps_Q^2 (q={certificate['q']}): "
+                f"{'OK' if certificate['holds_on_deflated_prefix'] else 'VIOLATED'}\n"
+                f"worst lower gap {certificate['worst_lower_gap']:+.2e}  "
+                f"commit_solve={certificate.get('commit_solve')!r}"
+            )
+        if notes:
+            pr.text(
+                0.02,
+                0.02,
+                "\n".join(notes),
+                transform=pr.transAxes,
+                fontsize=6.5,
                 va="bottom",
                 bbox=dict(boxstyle="round", fc="white", alpha=0.8),
             )
