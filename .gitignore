@@ -9,6 +9,7 @@ __pycache__
 src/train/federated_learning/results
 old
 *results/
+*results2/
 *data/
 *experiments/
 

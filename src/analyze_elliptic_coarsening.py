@@ -123,7 +123,7 @@ def per_gang_edge_cost(cost, edge_index, gang_of, n_gangs):
 # --------------------------------------------------------------------------- #
 # plots
 # --------------------------------------------------------------------------- #
-def plot_gang_pr(results, gangs, train_ids, out: Path, top: int = 25):
+def plot_gang_pr(results, gangs, train_ids, out: Path, top: int = 25, title=None):
     order = sorted(range(len(gangs)), key=lambda i: gangs[i].num_nodes, reverse=True)[
         :top
     ]
@@ -145,7 +145,8 @@ def plot_gang_pr(results, gangs, train_ids, out: Path, top: int = 25):
     ax.set_ylabel("score")
     ax.set_ylim(0, 1.14)
     ax.set_title(
-        f"(1) Per-gang recall / precision (top {len(order)} by size)   ★ detected  ✗ missed"
+        title
+        or f"(1) Per-gang recall / precision (top {len(order)} by size)   ★ detected  ✗ missed"
     )
     ax.legend(loc="center right")
     ax.grid(axis="y", alpha=0.3)
@@ -154,7 +155,9 @@ def plot_gang_pr(results, gangs, train_ids, out: Path, top: int = 25):
     plt.close(fig)
 
 
-def plot_edge_cost(cost, categories, pg_cost, gang_sizes, detected, out: Path):
+def plot_edge_cost(
+    cost, categories, pg_cost, gang_sizes, detected, out: Path, title=None
+):
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
 
     # (a) per-gang medians (each gang weighted equally -- not dominated by the few
@@ -209,6 +212,8 @@ def plot_edge_cost(cost, categories, pg_cost, gang_sizes, detected, out: Path):
     # (c) conductance vs cost ratio
     axes[2].axis("off")
     fig.colorbar(sc, ax=axes[2], fraction=0.5, label="detected (0/1)")
+    if title:
+        fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -230,7 +235,9 @@ def plot_edge_cost(cost, categories, pg_cost, gang_sizes, detected, out: Path):
     return med, below, int(ok.sum())
 
 
-def plot_gang_graph(edge_index, cost, gang_id, gang_nodes, out: Path, max_halo=250):
+def plot_gang_graph(
+    edge_index, cost, gang_id, gang_nodes, out: Path, max_halo=250, title=None
+):
     gang_set = set(int(v) for v in gang_nodes)
     u, v = edge_index[0].numpy(), edge_index[1].numpy()
     inc = np.where(np.isin(u, list(gang_set)) | np.isin(v, list(gang_set)))[0]
@@ -264,7 +271,8 @@ def plot_gang_graph(edge_index, cost, gang_id, gang_nodes, out: Path, max_halo=2
     )
     fig.colorbar(ec, ax=ax, label=r"$\log_{10}$ edge cost")
     ax.set_title(
-        f"(2c) Gang {gang_id} ({len(gang_set)} nodes, red) + halo (blue)\n"
+        title
+        or f"(2c) Gang {gang_id} ({len(gang_set)} nodes, red) + halo (blue)\n"
         "edges by learned cost: cheap interior, costly boundary"
     )
     ax.axis("off")
@@ -516,6 +524,7 @@ def analyze_coarsening(
             else None
         ),
     }
+
     # every median here is None when its group is empty -- a coarsening that
     # detects nothing (or everything) is a legitimate outcome to report, not a
     # crash, so format defensively.
