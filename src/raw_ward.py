@@ -78,6 +78,8 @@ from smooth_dual_ward import (
     screened_operators,
 )
 
+_SCORES = ("raw", "ward", "ward_vol", "deflated", "deflated_unnorm")
+
 __all__ = [
     "RawWardResult",
     "rank_q_level",
@@ -303,6 +305,23 @@ def raw_ward(
         denominator is bounded below by ``tau``).
     score:
         ``"raw"`` -- the paper's ``s^0_R(A,B)``, the undeflated normalized score.
+        ``"ward"`` -- the classical Ward increment
+        ``|A||B|/(|A|+|B|) * ||U_bar_A - U_bar_B||_2^2`` on the *primal*
+        ``M_tau``-orthonormal target basis with **cardinality** block means: the
+        quantity ``src.ward_pr_sweep.ward_order`` (sklearn, connectivity-
+        constrained) minimizes.  Running it here puts it in the same engine as
+        the other four, so a difference between them is a difference of score
+        alone.
+        ``"ward_vol"`` -- the *unnormalized* raw score
+        ``m(A,B)^2 ||ell_bar_A - ell_bar_B||^2_{G^-1}``, i.e. ``"raw"`` with the
+        ``||g||^2_{M_tau}`` denominator removed (equivalently
+        ``||Q_R^tau g_{A,B}||^2_{M_tau}`` with ``g`` left at its natural scale).
+        It sits exactly between ``"ward"`` and ``"raw"``: it keeps the dual level
+        and the volume mass of ``"raw"`` and drops only the normalization.
+        ``"deflated_unnorm"`` -- the same removal applied to the deflated score,
+        ``||Q_R^tau (I - Q_{P'}^tau) g_{A,B}||^2_{M_tau}
+        = ||g||^2_{M_tau} (1 - eta^2) s_{P_n}(A,B)``.  With ``"deflated"`` this
+        completes a 2x2 (raw vs deflated) x (normalized vs not) design.
         ``"deflated"`` -- the EXACT deflated score
         ``s_{P_n}(A,B) = ||Q_R^tau h_hat_{A,B}||^2_{M_tau}`` of
         eq. (deflated score), where ``h_hat`` is ``h_{A,B}`` made ``M_tau``-orthogonal
@@ -339,7 +358,7 @@ def raw_ward(
     n = A.shape[0]
     ell, G, level, q_eff = rank_q_level(Z, M, kappa, rank_tol=rank_tol)
     U = None
-    if evaluate_rsa:
+    if evaluate_rsa or score == "ward":
         U, _ = m_orthonormal_basis(Z, M, rank_tol=rank_tol)
 
     # ---- block state, indexed by immutable block id -------------------------
@@ -357,6 +376,16 @@ def raw_ward(
     active[:n] = True
     size = np.zeros(max_ids, dtype=np.int64)
     size[:n] = 1
+    # ``score="ward"`` is the only variant whose block representative is the
+    # *cardinality* mean of the *primal* basis; it gets its own state so the
+    # volume-weighted dual level every other score uses is untouched.
+    prim = (
+        np.zeros((max_ids, U.shape[1]), dtype=np.float64)
+        if score == "ward"
+        else None
+    )
+    if prim is not None:
+        prim[:n] = U
 
     coo = sp.triu(A, k=1).tocoo()
     nbr: List[Dict[int, float]] = [dict() for _ in range(max_ids)]
@@ -373,9 +402,9 @@ def raw_ward(
     # (u_C^T L u_D = 1_C^T (K - W~) 1_D, whose diagonal collapses to the cut.)
     # So no fine-grained N x N algebra is ever needed -- and neither is any
     # N-vector, because U^T M_tau u_C = kappa(C) * ell_bar_C = vol[C] * lev[C].
-    deflated = score == "deflated"
-    if score not in ("raw", "deflated"):
-        raise ValueError("score must be 'raw' or 'deflated'")
+    if score not in _SCORES:
+        raise ValueError(f"score must be one of {_SCORES}, got {score!r}")
+    deflated = score in ("deflated", "deflated_unnorm")
     slot = np.full(max_ids, -1, dtype=np.int64)
     alive: List[int] = list(range(n))
     slot[:n] = np.arange(n)
@@ -403,8 +432,15 @@ def raw_ward(
         step_cache["vals"] = np.asarray(vals, dtype=np.float64)
         step_cache["VL"] = vol[ids][:, None] * lev[ids]  # (k, q): U^T M_tau u_C
 
+    unnormalized = score == "deflated_unnorm"
+
     def deflated_scores_many(c: int, ks: np.ndarray, ws: np.ndarray):
-        """Exact ``s_{P_n}(c, k)`` and leakage ``eta_n(c, k)`` for each ``k``."""
+        """Exact ``s_{P_n}(c, k)`` and leakage ``eta_n(c, k)`` for each ``k``.
+
+        With ``score="deflated_unnorm"`` the returned score is instead
+        ``||Q_R (I - Q_{P'}) g||^2_{M_tau}`` -- the same eliminated direction, at
+        the natural scale of ``g`` rather than renormalized to a unit vector.
+        """
 
         from src.deflated_coarsen import _block_cg
 
@@ -464,6 +500,10 @@ def raw_ward(
             a_vec = (umh - proj) / denom
             out_s[t] = float(a_vec @ a_vec)
             out_eta[t] = math.sqrt(eta_sq)
+            if unnormalized:
+                # ||Q_R (I - Q_{P'}) g||^2 = ||g||^2_{M_tau} (1 - eta^2) s,
+                # and ||g||^2_{M_tau} = m^2 ||h||^2_{M_tau}
+                out_s[t] *= m2 * h_sq * (1.0 - eta_sq)
         return out_s, out_eta
 
     def scores_many(c: int, ks: np.ndarray, ws: np.ndarray):
@@ -483,6 +523,14 @@ def raw_ward(
         cut_term = vb * (ocut[c] / va) + va * (ocut[ks] / vb) + 2.0 * ws
         ell_ab = np.maximum(cut_term / s, 0.0)
         m_tau = ell_ab + tau
+        if score == "ward":
+            ca = float(size[c])
+            cb = size[ks].astype(np.float64)
+            dp = prim[ks] - prim[c]
+            ward = (ca * cb / (ca + cb)) * np.einsum("ij,ij->i", dp, dp)
+            return np.maximum(ward, 0.0), numer, m_tau, ell_ab
+        if score == "ward_vol":
+            return numer, numer, m_tau, ell_ab
         return numer / m_tau, numer, m_tau, ell_ab
 
     # ---- initial queue: one entry per edge ----------------------------------
@@ -499,6 +547,11 @@ def raw_ward(
         numer0 = (va0 * vb0 / s0) * np.einsum("ij,ij->i", diff0, diff0)
         cut0 = (vb0 * (ocut[rows] / va0) + va0 * (ocut[cols] / vb0) + 2.0 * vals) / s0
         keys0 = np.maximum(numer0, 0.0) / (np.maximum(cut0, 0.0) + tau)
+        if score == "ward":
+            dp0 = U[rows] - U[cols]
+            keys0 = 0.5 * np.einsum("ij,ij->i", dp0, dp0)  # |A||B|/(|A|+|B|) = 1/2
+        elif score == "ward_vol":
+            keys0 = np.maximum(numer0, 0.0)
         if deflated:
             # one edge at a time: every candidate needs its own A_{P'}
             _refresh_block_matrix()
@@ -570,6 +623,9 @@ def raw_ward(
         va, vb = vol[a], vol[b]
         vol[new] = va + vb
         lev[new] = (va * lev[a] + vb * lev[b]) / (va + vb)  # volume-weighted mean
+        if prim is not None:  # cardinality-weighted mean of the primal basis
+            ca, cb = float(size[a]), float(size[b])
+            prim[new] = (ca * prim[a] + cb * prim[b]) / (ca + cb)
         ocut[new] = ocut[a] + ocut[b] - 2.0 * wab
         size[new] = size[a] + size[b]
         active[a] = active[b] = False

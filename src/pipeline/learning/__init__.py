@@ -8,6 +8,7 @@ from src.pipeline.learning.base import (
 )
 from src.pipeline.learning.nonlinear import GCNLearning, GraphSAGELearning
 from src.pipeline.learning.polynomial import PolynomialFilterLearning
+from src.pipeline.learning.spectral import StaticSpectralLearning
 
 __all__ = [
     "Learning",
@@ -15,6 +16,7 @@ __all__ = [
     "LearningResult",
     "GraphContext",
     "PolynomialFilterLearning",
+    "StaticSpectralLearning",
     "GCNLearning",
     "GraphSAGELearning",
     "build_learner",
@@ -24,6 +26,7 @@ _REGISTRY = {
     "polynomial": PolynomialFilterLearning,
     "gcn": GCNLearning,
     "graphsage": GraphSAGELearning,
+    "static_spectral": StaticSpectralLearning,
 }
 
 

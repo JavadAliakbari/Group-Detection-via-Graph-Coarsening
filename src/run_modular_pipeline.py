@@ -41,7 +41,7 @@ SYNTHETIC = DataConfig(
     num_groups=12,
     group_density=0.4,
     avg_degree=4.0,
-    feature_dim=32,
+    feature_dim=16,
     group_types=("random",),
     train_ratio=0.5,
     seed=3,
@@ -138,7 +138,7 @@ EXAMPLES: dict = {
             ),
             tau=TAU,
             degree=32,
-            num_heads=8,
+            num_heads=4,
             shared_filters=True,
             label_head_epochs=500,
             label_head_learning_rate=0.05,
@@ -255,8 +255,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--coarsening-method",
-        choices=["ward_tree", "raw_ward", "deflated_ward"],
-        default="ward_tree",
+        choices=["ward_tree", "raw_ward", "deflated_ward", "deflated_ward_tight"],
+        default="deflated_ward_tight",
     )
     parser.add_argument(
         "--cut-rule",

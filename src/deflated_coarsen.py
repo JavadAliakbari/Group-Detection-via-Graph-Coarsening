@@ -362,6 +362,9 @@ class DeflatedCoarseningResult:
     n_clusters_: int = 0
     mu_: float = float("nan")
     curve_: List[dict] = field(default_factory=list)
+    #: counters for the work the search actually did (rescored candidates,
+    #: deflation solves, queue pushes); see ``stats`` in :func:`deflated_coarsen`
+    stats_: dict = field(default_factory=dict)
 
     # -- level lookups ------------------------------------------------------
     def _level(self, n_clusters: int) -> dict:
@@ -475,6 +478,7 @@ def deflated_coarsen(
     tau: float,
     *,
     rule: str = "dual-ward",
+    selection: str = "normalized",
     n_clusters: int | None = None,
     build_full_tree: bool = False,
     hops: int = 2,
@@ -484,6 +488,7 @@ def deflated_coarsen(
     score_mode: str = "auto",
     max_cluster_size: int = 0,
     max_rescore: int = 8,
+    queue_key: str = "raw",
     fanout: int = 32,
     strict: bool = False,
     epsilon_max: float | None = None,
@@ -510,12 +515,54 @@ def deflated_coarsen(
     rule
         ``"dual-ward"`` (score ``||a||^2``) or ``"minimax"``
         (score ``lambda_max(H + a a^T)``).
+    selection
+        Which quantity **ranks** candidates.  ``"normalized"`` (the default, and
+        the paper's Eq. (deflated score)) uses the score itself,
+        ``s = ||Q_R^tau h_hat||^2_{M_tau}`` -- the *fraction* of the eliminated
+        unit direction the target retains.  ``"unnormalized"`` ranks by
+        ``||Q_R^tau (I - Q_{P'}^tau) g_{A,B}||^2_{M_tau}
+        = ||(I - Q_{P'}^tau) g||^2_{M_tau} * s``, the *absolute* target energy the
+        merge destroys, i.e. the same direction left at the natural scale of
+        ``g`` instead of renormalized.  Only the ranking changes: ``a_sq``, ``H``,
+        ``trace_h``, ``eps_Q`` and the certificate are the theoretical quantities
+        either way, so the cumulative-score bound is unaffected.  Note the
+        renormalization is what makes the score telescope, so greedy descent on
+        ``tr H_P^tau`` is claimed for ``"normalized"`` only.
     hops, max_ball, solve, commit_solve
         Deflation solve: ``"local"`` truncates ``(L_c + tau I) c = b`` to an
         ``hops``-hop coarse ball (capped at ``max_ball`` blocks), ``"exact"``
         solves the full coarse system.  ``commit_solve`` overrides the mode for
         the merge that is actually committed -- use ``"exact"`` to keep ``H``
         (and therefore the certificate) exact while ranking stays cheap.
+    queue_key
+        What the lazy queue stores, and therefore what its early exit
+        ``best <= min(remaining keys)`` is allowed to conclude.
+
+        ``"raw"`` (the historical default) stores the **raw** normalized score
+        ``s^0 = ||U^T M_tau g||^2 / ||g||^2_{M_tau}``.  That is an excellent hint
+        but *not* a lower bound on the deflated score: ``s >= s^0`` fails on a
+        small fraction of candidates, so the exit is heuristic and the search is
+        only as exhaustive as ``max_rescore`` makes it.
+
+        ``"certified"`` stores an admissible lower bound instead, so the exit is
+        exact and ``max_rescore`` degrades to a safety valve.  With
+        ``zeta_n := ||Q_R^tau Q_{P'}^tau h||_{M_tau}/||h||_{M_tau} <= eta_0``,
+
+            s (1 - eta_0^2) = s^0 - 2 sqrt(s^0) zeta cos(theta) + zeta^2
+                           >= (sqrt(s^0) - zeta)^2 >= [(sqrt(s^0) - eta_0)_+]^2,
+
+        and ``eta_0 <= ||b||_2 / (sqrt(tau) ||g||_{M_tau})`` by
+        ``A_{P'}^tau >= tau I`` (Lemma "leakage is local and computable"), whose
+        right-hand side is bounded in ``O(1)`` per candidate from the cached
+        per-block quantity ``T_C = sum_{j in N(C)} w_{Cj}^2 / vol(j)``:
+
+            ||b||^2 <= b_{AuB}^2 + 2 beta^2 T_A / vol(A) + 2 alpha^2 T_B / vol(B).
+
+        Both steps only ever *increase* ``eta_0``, so the stored key stays below
+        the true score.  The key is therefore a valid lower bound on the score of
+        a pair at the partition where it was pushed; the exit is exact up to the
+        ``O(q^r)`` movement of a distant pair's deflation, the same order as the
+        truncated solve itself.
     fanout
         How many queue entries a merge pushes for the new block: the ``fanout``
         neighbours with the best insertion key, or all of them if ``fanout <= 0``.
@@ -553,11 +600,20 @@ def deflated_coarsen(
 
     if rule not in ("dual-ward", "minimax"):
         raise ValueError("rule must be 'dual-ward' or 'minimax'")
+    if selection not in ("normalized", "unnormalized"):
+        raise ValueError("selection must be 'normalized' or 'unnormalized'")
+    if selection == "unnormalized" and rule != "dual-ward":
+        raise ValueError(
+            "selection='unnormalized' rescales the dual-Ward score; the minimax "
+            "rule ranks by lambda_max(H + a a^T), which has no such rescaling"
+        )
     if solve not in ("local", "exact"):
         raise ValueError("solve must be 'local' or 'exact'")
     commit_solve = solve if commit_solve is None else commit_solve
     if commit_solve not in ("local", "exact"):
         raise ValueError("commit_solve must be 'local' or 'exact'")
+    if queue_key not in ("raw", "certified"):
+        raise ValueError("queue_key must be 'raw' or 'certified'")
     if epsilon_key not in ("epsilon_q", "epsilon_pi"):
         raise ValueError("epsilon_key must be 'epsilon_q' or 'epsilon_pi'")
 
@@ -594,6 +650,14 @@ def deflated_coarsen(
         if w > 0.0:
             nbr[i][j] = w
             nbr[j][i] = w
+    # T_C = sum_{j in N(C)} w_{Cj}^2 / vol(j): everything the certified queue key
+    # needs from a block's boundary, maintained in the merge's existing
+    # neighbour loop.  Only materialized when that key is asked for.
+    certified = queue_key == "certified"
+    T = np.zeros(max_ids)
+    if certified:
+        for i in range(n):
+            T[i] = sum(w * w / vol[j] for j, w in nbr[i].items())
 
     H = np.zeros((d, d))  # harmonic residual H_P^tau
     Hpi = np.zeros((d, d))  # Euclidean residual (realized coarsening)
@@ -733,6 +797,7 @@ def deflated_coarsen(
                     val = -wk / math.sqrt(vol_c * vol[k])
                     A_loc[p, q] = val
                     A_loc[q, p] = val
+        stats["exact_solves" if mode == "exact" else "local_solves"] += 1
         c_loc = np.linalg.solve(A_loc, b_loc)
 
         bc = float(b_loc @ c_loc)
@@ -762,6 +827,9 @@ def deflated_coarsen(
             "gd_a": gd_a,
             "gd_b": gd_b,
             "eta0": eta0,
+            # ||(I - Q_{P'}^tau) g||^2_{M_tau}: the scale the renormalization
+            # divides out, and the factor selection="unnormalized" keeps
+            "gt_sq": float(gt_sq),
             # Lemma "leakage is local and computable": eta_0 <= ||b|| / (sqrt(tau)
             # ||g||_{M_tau}), available without the solve (uses A_{P'} >= tau I).
             "eta0_bound": float(np.linalg.norm(b_loc)) / math.sqrt(tau * m_tau),
@@ -794,11 +862,37 @@ def deflated_coarsen(
         gd_b = (ocut[ks] + tau * vb) / vb
         m_tau = beta * beta * gd_a - 2.0 * alpha * beta * s_ab + alpha * alpha * gd_b
         umg = beta[:, None] * Pm[c_id] - alpha[:, None] * Pm[ks]
-        return np.einsum("ij,ij->i", umg, umg) / np.maximum(m_tau, _TINY)
+        energy = np.einsum("ij,ij->i", umg, umg)
+        if unnormalized:
+            # the undeflated analogue of the selection score, so the lazy
+            # queue's keys and its early-exit bound live on the same scale
+            return energy
+        m_tau = np.maximum(m_tau, _TINY)
+        s0 = energy / m_tau
+        if not certified:
+            return s0
+        return _certified_key(s0, m_tau, c_id, ks, alpha, beta, gd_a, gd_b, s_ab)
 
-    def score_of(a_vec: np.ndarray) -> float:
+    def _certified_key(s0, m_tau, c_id, ks, alpha, beta, gd_a, gd_b, s_ab):
+        """``[(sqrt(s0) - eta_bar)_+]^2``: a lower bound on the deflated score."""
+
+        b_ab = (
+            alpha * beta * gd_a
+            + (beta * beta - alpha * alpha) * s_ab
+            - alpha * beta * gd_b
+        )
+        b_sq = b_ab * b_ab + 2.0 * (
+            beta * beta * T[c_id] / vol[c_id] + alpha * alpha * T[ks] / vol[ks]
+        )
+        eta_bar = np.minimum(np.sqrt(b_sq / (tau * m_tau)), 1.0)
+        return np.square(np.maximum(np.sqrt(s0) - eta_bar, 0.0))
+
+    unnormalized = selection == "unnormalized"
+
+    def score_of(a_vec: np.ndarray, gt_sq: float = 1.0) -> float:
         if rule == "dual-ward":
-            return float(a_vec @ a_vec)
+            value = float(a_vec @ a_vec)
+            return value * gt_sq if unnormalized else value
         if score_mode == "secular":
             return rank_one_lambda_max(evals, evecs.T @ a_vec)
         cand = H + np.outer(a_vec, a_vec)
@@ -824,7 +918,16 @@ def deflated_coarsen(
     gd0 = (ocut[:n] + tau * d_tilde) / d_tilde
     mt0 = be0**2 * gd0[rows] - 2.0 * al0 * be0 * sab0 + al0**2 * gd0[cols]
     umg0 = be0[:, None] * MU[rows] - al0[:, None] * MU[cols]
-    keys0 = np.einsum("ij,ij->i", umg0, umg0) / np.maximum(mt0, _TINY)
+    energy0 = np.einsum("ij,ij->i", umg0, umg0)
+    mt0 = np.maximum(mt0, _TINY)
+    if unnormalized:
+        keys0 = energy0
+    elif certified:
+        keys0 = _certified_key(
+            energy0 / mt0, mt0, rows, cols, al0, be0, gd0[rows], gd0[cols], sab0
+        )
+    else:
+        keys0 = energy0 / mt0
     heap: List[tuple] = list(zip(keys0.tolist(), rows.tolist(), cols.tolist()))
     heapq.heapify(heap)
 
@@ -832,6 +935,9 @@ def deflated_coarsen(
     children: List[tuple] = []
     records: List[dict] = []
     curve: List[dict] = []
+    #: work actually done, so an approximation knob's cost is reported and not
+    #: inferred from wall time
+    stats = {"rescored": 0, "local_solves": 0, "exact_solves": 0, "pushes": 0}
     next_id = n
     cap = int(max_cluster_size) if max_cluster_size else 0
     target = int(n_clusters) if n_clusters is not None else 1
@@ -855,7 +961,7 @@ def deflated_coarsen(
                 if cap and size[a_id] + size[b_id] > cap:
                     continue
                 rec = deflate(a_id, b_id, solve)
-                sc = score_of(rec["a"])
+                sc = score_of(rec["a"], rec["gt_sq"])
                 if best is None or sc < best[0]:
                     best = (sc, a_id, b_id, rec)
             chosen = best
@@ -877,8 +983,9 @@ def deflated_coarsen(
                 if cap and size[a_id] + size[b_id] > cap:
                     continue
                 refreshed += 1
+                stats["rescored"] += 1
                 rec = deflate(a_id, b_id, solve)
-                sc = score_of(rec["a"])
+                sc = score_of(rec["a"], rec["gt_sq"])
                 if best is None or sc < best[0]:
                     if best is not None:
                         batch.append((best[0], best[1], best[2]))
@@ -978,6 +1085,7 @@ def deflated_coarsen(
                 Ge[ks] += cs[:, None] * ae
 
         merged: Dict[int, float] = {}
+        nbr_a_old, nbr_b_old = (nbr[a_id], nbr[b_id]) if certified else ({}, {})
         for k, w in nbr[a_id].items():
             if k != b_id and active[k]:
                 merged[k] = merged.get(k, 0.0) + w
@@ -994,6 +1102,17 @@ def deflated_coarsen(
             if w > 0.0:
                 nbr[new][k] = w
                 nbr[k][new] = w
+
+        if certified:
+            # T_j loses this block's two old contributions and gains the merged
+            # one; T_new is assembled from the same loop.
+            t_new = 0.0
+            for k, w in nbr[new].items():
+                wa = nbr_a_old.get(k, 0.0)
+                wb = nbr_b_old.get(k, 0.0)
+                T[k] += w * w / vol[new] - wa * wa / va - wb * wb / vb
+                t_new += w * w / vol[k]
+            T[new] = t_new
 
         active[a_id] = active[b_id] = False
         active[new] = True
@@ -1015,7 +1134,9 @@ def deflated_coarsen(
                 "new_id": int(new),
                 "n_clusters": int(n_active),
                 "score": float(sc),
+                "selection": selection,
                 "a_sq": float(a_vec @ a_vec),
+                "gt_sq": float(rec["gt_sq"]),
                 "lambda_max": float(cand_lam1) if need_spectrum else float("nan"),
                 "epsilon_q": float(cand_eps_q),
                 "epsilon_pi": float(cand_eps_pi),
@@ -1047,6 +1168,7 @@ def deflated_coarsen(
             if fanout > 0 and keys.size > fanout:
                 sel = np.argpartition(keys, fanout)[:fanout]
                 keys, ks = keys[sel], ks[sel]
+            stats["pushes"] += int(keys.size)
             for key, k in zip(keys.tolist(), ks.tolist()):
                 lo, hi = (k, new) if k < new else (new, k)
                 heapq.heappush(heap, (key, lo, hi))
@@ -1098,6 +1220,13 @@ def deflated_coarsen(
         n_leaves_=n,
         curve_=curve,
     )
+    merges = max(len(children), 1)
+    result.stats_ = {
+        **stats,
+        "merges": len(children),
+        "rescored_per_merge": stats["rescored"] / merges,
+        "solves_per_merge": (stats["local_solves"] + stats["exact_solves"]) / merges,
+    }
     if n_clusters is not None and build_full_tree:
         result.labels_ = result.labels_at(int(n_clusters))
     else:

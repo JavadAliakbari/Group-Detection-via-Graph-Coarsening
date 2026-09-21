@@ -86,7 +86,7 @@ __all__ = [
     "GraphContext",
 ]
 
-_ARCHITECTURES = ("polynomial", "gcn", "graphsage")
+_ARCHITECTURES = ("polynomial", "gcn", "graphsage", "static_spectral")
 _MODES = ("closed_form", "gradient")
 _BASES = ("chebyshev", "monomial")
 _ACTIVATIONS = {
@@ -149,11 +149,20 @@ class LearningConfig:
             raise ValueError(f"architecture must be one of {_ARCHITECTURES}")
         if self.training_mode not in _MODES:
             raise ValueError(f"training_mode must be one of {_MODES}")
-        if self.training_mode == "closed_form" and self.architecture != "polynomial":
+        if self.training_mode == "closed_form" and self.architecture not in (
+            "polynomial",
+            "static_spectral",
+        ):
             raise ValueError(
                 f"training_mode='closed_form' is only defined for the polynomial "
                 f"filter bank; {self.architecture!r} has no closed-form solution in "
                 "this repository.  Use training_mode='gradient'."
+            )
+        if self.architecture == "static_spectral" and self.training_mode != "closed_form":
+            raise ValueError(
+                "architecture='static_spectral' has nothing to train by gradient: "
+                "its target is a function of the graph alone.  Use "
+                "training_mode='closed_form', which fits only the label head."
             )
         if self.basis not in _BASES:
             raise ValueError(f"basis must be one of {_BASES}, got {self.basis!r}")

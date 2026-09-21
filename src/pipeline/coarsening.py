@@ -102,7 +102,61 @@ __all__ = [
     "Coarsening",
 ]
 
-_METHODS = ("ward_tree", "raw_ward", "deflated_ward")
+#: production merge rules
+_PRODUCTION_METHODS = (
+    "ward_tree",
+    "raw_ward",
+    "deflated_ward",
+    "deflated_ward_abs",
+    "deflated_ward_tight",
+)
+
+#: ``deflated_ward_tight`` -- the paper's score and the paper's greedy, with the
+#: two production approximations that were measurably costing detection removed:
+#:
+#: * the lazy queue's early exit is certified rather than heuristic
+#:   (``queue_key="certified"``), so the fixed ``max_rescore`` count is no longer
+#:   what ends the search -- the bound is;
+#: * the deflation solve sees a ball wide enough that the *ranking* score is the
+#:   theoretical one to well under the gaps that decide merges.
+#:
+#: The merge score itself is untouched, so every statement the paper proves about
+#: it still applies; what changes is that the implementation now actually
+#: minimizes it.  Explicit non-default settings in the config still win.
+#: Measured on the synthetic family at N = 3,000 (5 seeds x 8 graphs, the same
+#: frozen representation for every arm), as the paired change in best-achievable
+#: F1 against production ``deflated_ward``:
+#:
+#:   fanout 32 -> 0            +0.001  (p = 0.29)     -- not the problem
+#:   ball 32/2 hops -> 64/3    -0.018  (p = 4e-3)     -- and not this either
+#:   max_rescore 8 -> 4096     +0.061  (p = 4e-12, 39/40 graphs)
+#:
+#: So the whole deficit was the fixed count cap on the lazy queue's rescoring:
+#: eight pops per merge is far too few to find the minimum-score pair (the
+#: selection audit puts the committed merge at median rank 13 of several hundred
+#: candidates).  Removing the cap is only *principled* once the queue's early
+#: exit is a real bound, which is what ``queue_key="certified"`` supplies; that
+#: costs -0.006 F1 (p = 0.04) and ~35% runtime relative to keeping the
+#: historical raw hint, and buys a sound stopping condition instead of a
+#: heuristic one.  The ball is left at the production setting: widening it did
+#: not help at this scale and cost 50% more time.
+_TIGHT_PRESET = {
+    "deflated_max_rescore": 4096,
+    "deflated_queue_key": "certified",
+}
+#: diagnostic arms: all five run in the *same* engine (:func:`src.raw_ward.raw_ward`
+#: -- one eager heap, one stale-entry policy, one local update), so a difference
+#: between them is a difference of **score** and of nothing else.  ``ladder_ward``
+#: reproduces ``ward_tree``'s tree exactly when both see the same basis.
+_LADDER = {
+    "ladder_ward": "ward",
+    "ladder_ward_vol": "ward_vol",
+    "ladder_raw": "raw",
+    "ladder_deflated": "deflated",
+    "ladder_deflated_abs": "deflated_unnorm",
+}
+_DEFLATED_METHODS = ("deflated_ward", "deflated_ward_abs", "deflated_ward_tight")
+_METHODS = _PRODUCTION_METHODS + tuple(_LADDER)
 _CUT_RULES = ("epsilon", "epsilon_q", "score_sum", "reduction", "f1")
 #: rules that stop at the coarsest level whose axis is still within ``epsilon_budget``
 _BUDGETED_RULES = ("epsilon", "epsilon_q", "score_sum")
@@ -134,6 +188,20 @@ class CoarseningConfig:
     # so it is only usable for N <= 4000
     deflated_solve: str = "local"
     deflated_commit_solve: str = "local"
+    #: what ranks candidates under ``deflated_ward``; ``deflated_ward_abs`` forces
+    #: ``"unnormalized"``.  The recorded score, ``H``, ``eps_Q`` and the
+    #: certificate are the theoretical quantities either way.
+    deflated_selection: str = "normalized"
+    #: ``"raw"`` (the historical hint) or ``"certified"`` (an admissible lower
+    #: bound, which makes the lazy queue's early exit exact)
+    deflated_queue_key: str = "raw"
+    #: exhaustive selection: score **every** admissible pair at every merge
+    #: instead of the lazy-queue prefix.  ``O(E)`` solves per merge -- diagnostic
+    #: only, for graphs of a few hundred nodes.
+    deflated_strict: bool = False
+    #: rank tolerance of the ``M_tau``-orthonormalization.  ``ward_tree`` uses
+    #: ``eps * max(shape)``, the others ``1e-10``; matching them is an ablation.
+    rank_tol: float = 1e-10
     transfer_cut_rule: str = "epsilon"
     seed: int = 0
 
@@ -164,6 +232,14 @@ class CoarseningConfig:
         for name in ("deflated_solve", "deflated_commit_solve"):
             if getattr(self, name) not in ("local", "exact"):
                 raise ValueError(f"{name} must be 'local' or 'exact'")
+        if self.deflated_queue_key not in ("raw", "certified"):
+            raise ValueError("deflated_queue_key must be 'raw' or 'certified'")
+        if self.deflated_selection not in ("normalized", "unnormalized"):
+            raise ValueError(
+                "deflated_selection must be 'normalized' or 'unnormalized'"
+            )
+        if self.rank_tol <= 0.0:
+            raise ValueError("rank_tol must be strictly positive")
 
 
 @dataclass
@@ -278,6 +354,9 @@ class CoarseningResult:
     deflated_certificate: "dict | None" = None
     score_certificate: "dict | None" = None
     config: dict = field(default_factory=dict)
+    #: wall-clock seconds: ``hierarchy`` (the merge tree alone) and ``total``
+    #: (tree, epsilon axes, trajectory, both cuts and the certificates)
+    timings: dict = field(default_factory=dict)
 
     # the stopping rule is the deployable answer, so it is what the bare
     # attributes refer to
@@ -520,7 +599,7 @@ class Coarsening:
             children = np.asarray(children, dtype=np.int64)
             scores = np.asarray(distances, dtype=np.float64)
             context = {"a0": a0, "metric": metric}
-        elif method == "raw_ward":
+        elif method == "raw_ward" or method in _LADDER:
             from raw_ward import raw_ward
 
             result = raw_ward(
@@ -528,8 +607,10 @@ class Coarsening:
                 basis.detach().cpu().numpy(),
                 c.tau,
                 geometry="symmetric",
+                score=_LADDER.get(method, "raw"),
                 n_clusters=None,
                 build_full_tree=True,
+                rank_tol=c.rank_tol,
                 max_cluster_size=c.max_cluster_size,
             )
             children = np.asarray(result.children_, dtype=np.int64).reshape(-1, 2)
@@ -540,19 +621,41 @@ class Coarsening:
         else:
             from src.deflated_coarsen import deflated_coarsen
 
+            selection = (
+                "unnormalized" if method == "deflated_ward_abs" else c.deflated_selection
+            )
+            knobs = dict(
+                deflated_hops=c.deflated_hops,
+                deflated_max_ball=c.deflated_max_ball,
+                deflated_max_rescore=c.deflated_max_rescore,
+                deflated_queue_key=c.deflated_queue_key,
+            )
+            if method == "deflated_ward_tight":
+                defaults = CoarseningConfig()
+                knobs.update(
+                    {
+                        k: v
+                        for k, v in _TIGHT_PRESET.items()
+                        if knobs[k] == getattr(defaults, k)
+                    }
+                )
             result = deflated_coarsen(
                 _to_scipy(graph.adjacency),
                 basis.detach().cpu().numpy(),
                 c.tau,
                 rule="dual-ward",
+                selection=selection,
                 n_clusters=None,
                 build_full_tree=True,
-                hops=c.deflated_hops,
-                max_ball=c.deflated_max_ball,
-                max_rescore=c.deflated_max_rescore,
+                hops=knobs["deflated_hops"],
+                max_ball=knobs["deflated_max_ball"],
+                max_rescore=knobs["deflated_max_rescore"],
+                queue_key=knobs["deflated_queue_key"],
                 fanout=c.deflated_fanout,
                 solve=c.deflated_solve,
                 commit_solve=c.deflated_commit_solve,
+                strict=c.deflated_strict,
+                rank_tol=c.rank_tol,
                 max_cluster_size=c.max_cluster_size,
                 track_euclidean=False,
                 record_curve=False,
@@ -758,7 +861,12 @@ class Coarsening:
                 "merge_type": (
                     "completion"
                     if merges > hierarchy.constrained_merges
-                    else "deflated" if hierarchy.method == "deflated_ward" else "ward"
+                    else (
+                        "deflated"
+                        if hierarchy.method.startswith("deflated")
+                        or hierarchy.method.startswith("ladder_deflated")
+                        else "ward"
+                    )
                 ),
             }
             for name, values in columns.items():
@@ -904,7 +1012,11 @@ class Coarsening:
         if not groups:
             raise ValueError(f"graph {graph.graph_id!r} has no groups to evaluate")
 
+        import time
+
+        started = time.perf_counter()
         hierarchy, context = self.build_hierarchy(graph, basis)
+        hierarchy_seconds = time.perf_counter() - started
         epsilon, exact_flags, a0, metric = self._epsilon_axis(
             graph, basis, hierarchy, context
         )
@@ -940,7 +1052,7 @@ class Coarsening:
         wants_score = "score_sum" in (rule, c.transfer_cut_rule)
         wants_q = c.epsilon_q_budget > 0 and (
             "epsilon_q" in (rule, c.transfer_cut_rule)
-            or (wants_score and c.method == "deflated_ward")
+            or (wants_score and c.method in _DEFLATED_METHODS)
         )
         harmonic = (
             self._harmonic_evaluator(graph, basis, hierarchy) if wants_q else None
@@ -1073,7 +1185,7 @@ class Coarsening:
                     )
 
         certificate = None
-        if c.method == "deflated_ward":
+        if c.method in _DEFLATED_METHODS:
             certificate = _deflated_certificate(
                 graph, basis, labels, c.tau, exact_epsilon
             )
@@ -1106,6 +1218,10 @@ class Coarsening:
             deflated_certificate=certificate,
             score_certificate=score_certificate,
             config=asdict(c),
+            timings={
+                "hierarchy": hierarchy_seconds,
+                "total": time.perf_counter() - started,
+            },
         )
 
     def _evaluate_cut(

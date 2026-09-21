@@ -376,6 +376,21 @@ class LoggingVisualization:
             self._plot_training(result)
 
     def _log_closed_form(self, report: dict) -> None:
+        if report.get("solver") == "static_spectral":
+            # nothing was fitted: the target is a function of the graph alone.
+            # Report what the subspace IS instead of a pencil solve that did not
+            # happen, and leave the polynomial branch below untouched.
+            for graph_id, record in sorted(report.get("per_graph", {}).items()):
+                LOGGER.info(
+                    f"  static spectral target [{graph_id}]: q="
+                    f"{record['returned_q']} of {record['requested_q']} requested, "
+                    f"{record['operator']}, {record['ordering']}, lambda in "
+                    f"[{record['eigenvalue_min']:.4g}, {record['eigenvalue_max']:.4g}], "
+                    f"constant eigenvector kept, {record['solver']}, "
+                    f"{record['seconds']:.1f}s"
+                )
+            self._write_json(report, ("training", "static_spectral.json"))
+            return
         LOGGER.info(
             f"  closed form [{report['form']}]: {report['n_pencils']} pencil(s), "
             f"dictionary Gram rank {report['gram_rank_median']:.0f}/"

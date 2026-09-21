@@ -116,8 +116,16 @@ class PipelineResult:
         }
 
 
-def run_pipeline(config: PipelineConfig) -> PipelineResult:
-    """Data -> Learning -> Coarsening -> evaluation -> reporting."""
+def run_pipeline(config: PipelineConfig, *, learner=None) -> PipelineResult:
+    """Data -> Learning -> Coarsening -> evaluation -> reporting.
+
+    ``learner`` lets a caller inject an already-constructed
+    :class:`~src.pipeline.learning.Learning` instead of the one
+    ``config.learning.architecture`` names -- the same object the registry would
+    build, but carrying per-graph state a config field cannot express (the static
+    spectral target's per-graph width, for instance).  Its architecture must
+    still match the config, so nothing downstream can disagree about what ran.
+    """
 
     reporter = LoggingVisualization(config.logging)
     reporter.log_configuration(config.to_dict())
@@ -125,7 +133,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     bundle = Data(config.data).run()
     reporter.log_dataset(bundle)
 
-    learner = build_learner(config.learning)
+    if learner is not None and learner.config.architecture != config.learning.architecture:
+        raise ValueError(
+            f"the injected learner is {learner.config.architecture!r} but the config "
+            f"says {config.learning.architecture!r}"
+        )
+    learner = build_learner(config.learning) if learner is None else learner
     learning_result = learner.run(bundle.train_graphs)
     reporter.log_learning(learning_result)
 
